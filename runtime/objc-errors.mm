@@ -74,14 +74,16 @@ void _objc_error(id rcv, const char *fmt, va_list args)
 
 #else
 
-#include <vproc_priv.h>
 #include <_simple.h>
 
-OBJC_EXPORT void	(*_error)(id, const char *, va_list);
-
-static void _objc_trap(void) __attribute__((noreturn));
+// Return true if c is a UTF8 continuation byte
+static bool isUTF8Continuation(char c)
+{
+    return (c & 0xc0) == 0x80;  // continuation byte is 0b10xxxxxx
+}
 
 // Add "message" to any forthcoming crash log.
+mutex_t crashlog_lock;
 static void _objc_crashlog(const char *message)
 {
     char *newmsg;
@@ -98,13 +100,20 @@ static void _objc_crashlog(const char *message)
     }
 #endif
 
-    static mutex_t crashlog_lock = MUTEX_INITIALIZER;
-    mutex_lock(&crashlog_lock);
+    mutex_locker_t lock(crashlog_lock);
 
     char *oldmsg = (char *)CRGetCrashLogMessage();
+    size_t oldlen;
+    const size_t limit = 8000;
 
     if (!oldmsg) {
         newmsg = strdup(message);
+    } else if ((oldlen = strlen(oldmsg)) > limit) {
+        // limit total length by dropping old contents
+        char *truncmsg = oldmsg + oldlen - limit;
+        // advance past partial UTF-8 bytes
+        while (isUTF8Continuation(*truncmsg)) truncmsg++;
+        asprintf(&newmsg, "... %s\n%s", truncmsg, message);
     } else {
         asprintf(&newmsg, "%s\n%s", oldmsg, message);
     }
@@ -117,8 +126,6 @@ static void _objc_crashlog(const char *message)
         if (oldmsg) free(oldmsg);
         CRSetCrashLogMessage(newmsg);
     }
-
-    mutex_unlock(&crashlog_lock);
 }
 
 // Returns true if logs should be sent to stderr as well as syslog.
@@ -129,15 +136,10 @@ static bool also_do_stderr(void)
     int ret = fstat(STDERR_FILENO, &st);
     if (ret < 0) return false;
     mode_t m = st.st_mode & S_IFMT;
-    if (m == S_IFREG  ||  m == S_IFSOCK) return true;
-    if (!(m == S_IFIFO  ||  m == S_IFCHR)) return false;
-
-    // if it could be a pipe back to launchd, fail
-    int64_t val = 0;
-    vproc_swap_integer(NULL, VPROC_GSK_IS_MANAGED, NULL, &val);
-    if (val) return false;
-    
-    return true;
+    if (m == S_IFREG  ||  m == S_IFSOCK  ||  m == S_IFIFO  ||  m == S_IFCHR) {
+        return true;
+    }
+    return false;
 }
 
 // Print "message" to the console.
@@ -153,23 +155,15 @@ static void _objc_syslog(const char *message)
 /*
  * _objc_error is the default *_error handler.
  */
-#if __OBJC2__
-__attribute__((noreturn))
-#else
+#if !__OBJC2__
 // used by ExceptionHandling.framework
 #endif
+__attribute__((noreturn))
 void _objc_error(id self, const char *fmt, va_list ap) 
 { 
-    char *buf1;
-    char *buf2;
-
-    vasprintf(&buf1, fmt, ap);
-    asprintf(&buf2, "objc[%d]: %s: %s\n", 
-             getpid(), object_getClassName(self), buf1);
-    _objc_syslog(buf2);
-    _objc_crashlog(buf2);
-
-    _objc_trap();
+    char *buf;
+    vasprintf(&buf, fmt, ap);
+    _objc_fatal("%s: %s", object_getClassName(self), buf);
 }
 
 /*
@@ -187,25 +181,42 @@ void __objc_error(id rcv, const char *fmt, ...)
     va_end(vp);
 }
 
-/*
- * this routine handles severe runtime errors...like not being able
- * to read the mach headers, allocate space, etc...very uncommon.
- */
+static __attribute__((noreturn))
+void _objc_fatalv(uint64_t reason, uint64_t flags, const char *fmt, va_list ap)
+{
+    char *buf1;
+    vasprintf(&buf1, fmt, ap);
+
+    char *buf2;
+    asprintf(&buf2, "objc[%d]: %s\n", getpid(), buf1);
+    _objc_syslog(buf2);
+
+    if (DebugDontCrash) {
+        char *buf3;
+        asprintf(&buf3, "objc[%d]: HALTED\n", getpid());
+        _objc_syslog(buf3);
+        _Exit(1);
+    }
+    else {
+        abort_with_reason(OS_REASON_OBJC, reason, buf1, flags);
+    }
+}
+
+void _objc_fatal_with_reason(uint64_t reason, uint64_t flags, 
+                             const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    _objc_fatalv(reason, flags, fmt, ap);
+}
+
 void _objc_fatal(const char *fmt, ...)
 {
     va_list ap; 
-    char *buf1;
-    char *buf2;
-
     va_start(ap,fmt); 
-    vasprintf(&buf1, fmt, ap);
-    va_end (ap);
-
-    asprintf(&buf2, "objc[%d]: %s\n", getpid(), buf1);
-    _objc_syslog(buf2);
-    _objc_crashlog(buf2);
-
-    _objc_trap();
+    _objc_fatalv(OBJC_EXIT_REASON_UNSPECIFIED, 
+                 OS_REASON_FLAG_ONE_TIME_FAILURE, 
+                 fmt, ap);
 }
 
 /*
@@ -271,22 +282,6 @@ void _objc_inform_now_and_on_crash(const char *fmt, ...)
 
     free(buf2);
     free(buf1);
-}
-
-
-/* Kill the process in a way that generates a crash log. 
- * This is better than calling exit(). */
-static void _objc_trap(void) 
-{
-    __builtin_trap();
-}
-
-/* Try to keep _objc_warn_deprecated out of crash logs 
- * caused by _objc_trap(). rdar://4546883 */
-__attribute__((used))
-static void _objc_trap2(void)
-{
-    __builtin_trap();
 }
 
 #endif

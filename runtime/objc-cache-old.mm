@@ -206,7 +206,7 @@ CacheInstrumentation emptyCacheInstrumentation = {0};
 
 /* Local prototypes */
 
-static BOOL _cache_isEmpty(Cache cache);
+static bool _cache_isEmpty(Cache cache);
 static Cache _cache_malloc(uintptr_t slotCount);
 static Cache _cache_create(Class cls);
 static Cache _cache_expand(Class cls);
@@ -216,7 +216,7 @@ static void _garbage_make_room(void);
 static void _cache_collect_free(void *data, size_t size);
 
 #if defined(CACHE_ALLOCATOR)
-static BOOL cache_allocator_is_block(void *block);
+static bool cache_allocator_is_block(void *block);
 static Cache cache_allocator_calloc(size_t size);
 static void cache_allocator_free(void *block);
 #endif
@@ -246,7 +246,7 @@ static size_t log2u(size_t x)
 * Returns YES if the given cache is some empty cache.
 * Empty caches should never be allocated on the heap.
 **********************************************************************/
-static BOOL _cache_isEmpty(Cache cache)
+static bool _cache_isEmpty(Cache cache)
 {
     return (cache == NULL  ||  cache == (Cache)&_objc_empty_cache  ||  cache->mask == 0);
 }
@@ -263,22 +263,22 @@ static Cache _cache_malloc(uintptr_t slotCount)
     Cache new_cache;
     size_t size;
 
-    mutex_assert_locked(&cacheUpdateLock);
+    cacheUpdateLock.assertLocked();
 
     // Allocate table (why not check for failure?)
     size = sizeof(struct objc_cache) + TABLE_SIZE(slotCount);
 #if defined(OBJC_INSTRUMENTED)
     // Custom cache allocator can't handle instrumentation.
     size += sizeof(CacheInstrumentation);
-    new_cache = _calloc_internal(size, 1);
+    new_cache = calloc(size, 1);
     new_cache->mask = slotCount - 1;
 #elif !defined(CACHE_ALLOCATOR)
     // fixme cache allocator implementation isn't 64-bit clean
-    new_cache = _calloc_internal(size, 1);
+    new_cache = calloc(size, 1);
     new_cache->mask = (unsigned int)(slotCount - 1);
 #else
-    if (size < CACHE_ALLOCATOR_MIN  ||  UseInternalZone) {
-        new_cache = (Cache)_calloc_internal(size, 1);
+    if (size < CACHE_ALLOCATOR_MIN) {
+        new_cache = (Cache)calloc(size, 1);
         new_cache->mask = slotCount - 1;
         // occupied and buckets and instrumentation are all zero
     } else {
@@ -310,7 +310,7 @@ static Cache _cache_malloc(uintptr_t slotCount)
 static inline int isPowerOf2(unsigned long l) { return 1 == __builtin_popcountl(l); }
 static void _cache_free_block(void *block)
 {
-    mutex_assert_locked(&cacheUpdateLock);
+    cacheUpdateLock.assertLocked();
 
 #if !TARGET_OS_WIN32
     if (PrintCaches) {
@@ -347,7 +347,7 @@ void _cache_free(Cache cache)
 {
     unsigned int i;
 
-    mutex_lock(&cacheUpdateLock);
+    mutex_locker_t lock(cacheUpdateLock);
 
     for (i = 0; i < cache->mask + 1; i++) {
         cache_entry *entry = (cache_entry *)cache->buckets[i];
@@ -357,8 +357,6 @@ void _cache_free(Cache cache)
     }
     
     _cache_free_block(cache);
-
-    mutex_unlock(&cacheUpdateLock);
 }
 
 
@@ -372,7 +370,7 @@ static Cache _cache_create(Class cls)
 {
     Cache new_cache;
 
-    mutex_assert_locked(&cacheUpdateLock);
+    cacheUpdateLock.assertLocked();
 
     // Allocate new cache block
     new_cache = _cache_malloc(INIT_CACHE_SIZE);
@@ -405,7 +403,7 @@ static Cache _cache_expand(Class cls)
     uintptr_t slotCount;
     uintptr_t index;
 
-    mutex_assert_locked(&cacheUpdateLock);
+    cacheUpdateLock.assertLocked();
 
     // First growth goes from empty cache to a real one
     old_cache = cls->cache;
@@ -496,7 +494,7 @@ static Cache _cache_expand(Class cls)
 *
 * Cache locks: cacheUpdateLock must not be held.
 **********************************************************************/
-BOOL _cache_fill(Class cls, Method smt, SEL sel)
+bool _cache_fill(Class cls, Method smt, SEL sel)
 {
     uintptr_t newOccupied;
     uintptr_t index;
@@ -504,7 +502,7 @@ BOOL _cache_fill(Class cls, Method smt, SEL sel)
     cache_entry *entry;
     Cache cache;
 
-    mutex_assert_unlocked(&cacheUpdateLock);
+    cacheUpdateLock.assertUnlocked();
 
     // Never cache before +initialize is done
     if (!cls->isInitialized()) {
@@ -514,7 +512,7 @@ BOOL _cache_fill(Class cls, Method smt, SEL sel)
     // Keep tally of cache additions
     totalCacheFills += 1;
 
-    mutex_lock(&cacheUpdateLock);
+    mutex_locker_t lock(cacheUpdateLock);
 
     entry = (cache_entry *)smt;
 
@@ -525,7 +523,6 @@ BOOL _cache_fill(Class cls, Method smt, SEL sel)
     // Don't use _cache_getMethod() because _cache_getMethod() doesn't 
     // return forward:: entries.
     if (_cache_getImp(cls, sel)) {
-        mutex_unlock(&cacheUpdateLock);
         return NO; // entry is already cached, didn't add new one
     }
 
@@ -554,8 +551,6 @@ BOOL _cache_fill(Class cls, Method smt, SEL sel)
     }
     buckets[index] = entry;
 
-    mutex_unlock(&cacheUpdateLock);
-
     return YES; // successfully added new cache entry
 }
 
@@ -571,65 +566,13 @@ void _cache_addForwardEntry(Class cls, SEL sel)
 {
     cache_entry *smt;
   
-    smt = (cache_entry *)_malloc_internal(sizeof(cache_entry));
+    smt = (cache_entry *)malloc(sizeof(cache_entry));
     smt->name = sel;
     smt->imp = _objc_msgForward_impcache;
     if (! _cache_fill(cls, (Method)smt, sel)) {  // fixme hack
         // Entry not added to cache. Don't leak the method struct.
-        _free_internal(smt);
+        free(smt);
     }
-}
-
-
-/***********************************************************************
-* _cache_addIgnoredEntry
-* Add an entry for the ignored selector to cls's method cache.
-* Does nothing if the cache addition fails for any reason.
-* Returns the ignored IMP.
-* Cache locks: cacheUpdateLock must not be held.
-**********************************************************************/
-#if SUPPORT_GC  &&  !SUPPORT_IGNORED_SELECTOR_CONSTANT
-static cache_entry *alloc_ignored_entries(void)
-{
-    cache_entry *e = (cache_entry *)_malloc_internal(5 * sizeof(cache_entry));
-    e[0] = (cache_entry){ @selector(retain),     0,(IMP)&_objc_ignored_method};
-    e[1] = (cache_entry){ @selector(release),    0,(IMP)&_objc_ignored_method};
-    e[2] = (cache_entry){ @selector(autorelease),0,(IMP)&_objc_ignored_method};
-    e[3] = (cache_entry){ @selector(retainCount),0,(IMP)&_objc_ignored_method};
-    e[4] = (cache_entry){ @selector(dealloc),    0,(IMP)&_objc_ignored_method};
-    return e;
-}
-#endif
-
-IMP _cache_addIgnoredEntry(Class cls, SEL sel)
-{
-    cache_entry *entryp = NULL;
-
-#if !SUPPORT_GC
-    _objc_fatal("selector ignored with GC off");
-#elif SUPPORT_IGNORED_SELECTOR_CONSTANT
-    static cache_entry entry = { (SEL)kIgnore, 0, (IMP)&_objc_ignored_method };
-    entryp = &entry;
-    assert(sel == (SEL)kIgnore);
-#else
-    // hack
-    int i;
-    static cache_entry *entries;
-    INIT_ONCE_PTR(entries, alloc_ignored_entries(), free(v));
-
-    assert(ignoreSelector(sel));
-    for (i = 0; i < 5; i++) {
-        if (sel == entries[i].name) { 
-            entryp = &entries[i];
-            break;
-        }
-    }
-    if (!entryp) _objc_fatal("selector %s (%p) is not ignored", 
-                             sel_getName(sel), sel);
-#endif
-
-    _cache_fill(cls, (Method)entryp, sel);
-    return entryp->imp;
 }
 
 
@@ -644,7 +587,7 @@ void _cache_flush(Class cls)
     Cache cache;
     unsigned int index;
 
-    mutex_assert_locked(&cacheUpdateLock);
+    cacheUpdateLock.assertLocked();
 
     // Locate cache.  Ignore unused cache.
     cache = cls->cache;
@@ -690,9 +633,8 @@ void _cache_flush(Class cls)
 void flush_cache(Class cls)
 {
     if (cls) {
-        mutex_lock(&cacheUpdateLock);
+        mutex_locker_t lock(cacheUpdateLock);
         _cache_flush(cls);
-        mutex_unlock(&cacheUpdateLock);
     }
 }
 
@@ -751,8 +693,8 @@ static uintptr_t _get_pc_for_thread(thread_t thread)
 * reading function is in progress because it might still be using 
 * the garbage memory.
 **********************************************************************/
-OBJC_EXPORT uintptr_t objc_entryPoints[];
-OBJC_EXPORT uintptr_t objc_exitPoints[];
+extern "C" uintptr_t objc_entryPoints[];
+extern "C" uintptr_t objc_exitPoints[];
 
 static int _collecting_in_critical(void)
 {
@@ -856,7 +798,7 @@ static void _garbage_make_room(void)
     {
         first = 0;
         garbage_refs = (void**)
-            _malloc_internal(INIT_GARBAGE_COUNT * sizeof(void *));
+            malloc(INIT_GARBAGE_COUNT * sizeof(void *));
         garbage_max = INIT_GARBAGE_COUNT;
     }
 
@@ -864,7 +806,7 @@ static void _garbage_make_room(void)
     else if (garbage_count == garbage_max)
     {
         garbage_refs = (void**)
-            _realloc_internal(garbage_refs, garbage_max * 2 * sizeof(void *));
+            realloc(garbage_refs, garbage_max * 2 * sizeof(void *));
         garbage_max *= 2;
     }
 }
@@ -879,7 +821,7 @@ static void _garbage_make_room(void)
 **********************************************************************/
 static void _cache_collect_free(void *data, size_t size)
 {
-    mutex_assert_locked(&cacheUpdateLock);
+    cacheUpdateLock.assertLocked();
 
     _garbage_make_room ();
     garbage_byte_size += size;
@@ -894,7 +836,7 @@ static void _cache_collect_free(void *data, size_t size)
 **********************************************************************/
 void _cache_collect(bool collectALot)
 {
-    mutex_assert_locked(&cacheUpdateLock);
+    cacheUpdateLock.assertLocked();
 
     // Done if the garbage is not full
     if (garbage_byte_size < garbage_threshold  &&  !collectALot) {
@@ -1038,7 +980,7 @@ static cache_allocator_region *cache_allocator_add_region(size_t size)
     cache_allocator_block *b;
     cache_allocator_region **rgnP;
     cache_allocator_region *newRegion = (cache_allocator_region *)
-        _calloc_internal(1, sizeof(cache_allocator_region));
+        calloc(1, sizeof(cache_allocator_region));
 
     // Round size up to quantum boundary, and apply the minimum size.
     size += CACHE_QUANTUM - (size % CACHE_QUANTUM);
@@ -1150,7 +1092,7 @@ static Cache cache_allocator_calloc(size_t size)
 {
     cache_allocator_region *rgn;
 
-    mutex_assert_locked(&cacheUpdateLock);
+    cacheUpdateLock.assertLocked();
 
     for (rgn = cacheRegion; rgn != NULL; rgn = rgn->next) {
         void *p = cache_region_calloc(rgn, size);
@@ -1186,9 +1128,9 @@ static cache_allocator_region *cache_allocator_region_for_block(cache_allocator_
 * If ptr is a dead block from the cache allocator, result is undefined.
 * Cache locks: cacheUpdateLock must be held by the caller
 **********************************************************************/
-static BOOL cache_allocator_is_block(void *ptr)
+static bool cache_allocator_is_block(void *ptr)
 {
-    mutex_assert_locked(&cacheUpdateLock);
+    cacheUpdateLock.assertLocked();
     return (cache_allocator_region_for_block((cache_allocator_block *)ptr) != NULL);
 }
 
@@ -1203,7 +1145,7 @@ static void cache_allocator_free(void *ptr)
     cache_allocator_block *cur;
     cache_allocator_region *rgn;
 
-    mutex_assert_locked(&cacheUpdateLock);
+    cacheUpdateLock.assertLocked();
 
     if (! (rgn = cache_allocator_region_for_block(dead))) {
         // free of non-pointer
@@ -1307,7 +1249,7 @@ void _class_printMethodCaches(Class cls)
 /***********************************************************************
 * _class_printDuplicateCacheEntries.
 **********************************************************************/
-void _class_printDuplicateCacheEntries(BOOL detail)
+void _class_printDuplicateCacheEntries(bool detail)
 {
     NXHashState state;
     Class cls;

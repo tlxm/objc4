@@ -49,7 +49,21 @@ static inline size_t word_align(size_t x) {
     return (x + WORD_MASK) & ~WORD_MASK;
 }
 
+
+// Mix-in for classes that must not be copied.
+class nocopy_t {
+  private:
+    nocopy_t(const nocopy_t&) = delete;
+    const nocopy_t& operator=(const nocopy_t&) = delete;
+  protected:
+    constexpr nocopy_t() = default;
+    ~nocopy_t() = default;
+};
+
+
 #if TARGET_OS_MAC
+
+#   define OS_UNFAIR_LOCK_INLINE 1
 
 #   ifndef __STDC_LIMIT_MACROS
 #       define __STDC_LIMIT_MACROS
@@ -70,7 +84,6 @@ static inline size_t word_align(size_t x) {
 #   include <unistd.h>
 #   include <pthread.h>
 #   include <crt_externs.h>
-#   include <AssertMacros.h>
 #   undef check
 #   include <Availability.h>
 #   include <TargetConditionals.h>
@@ -78,8 +91,10 @@ static inline size_t word_align(size_t x) {
 #   include <sys/time.h>
 #   include <sys/stat.h>
 #   include <sys/param.h>
+#   include <sys/reason.h>
 #   include <mach/mach.h>
 #   include <mach/vm_param.h>
+#   include <mach/mach_time.h>
 #   include <mach-o/dyld.h>
 #   include <mach-o/ldsyms.h>
 #   include <mach-o/loader.h>
@@ -101,6 +116,8 @@ void vsyslog(int, const char *, va_list) UNAVAILABLE_ATTRIBUTE;
 #define ALWAYS_INLINE inline __attribute__((always_inline))
 #define NEVER_INLINE inline __attribute__((noinline))
 
+#define fastpath(x) (__builtin_expect(bool(x), 1))
+#define slowpath(x) (__builtin_expect(bool(x), 0))
 
 
 static ALWAYS_INLINE uintptr_t 
@@ -118,12 +135,19 @@ subc(uintptr_t lhs, uintptr_t rhs, uintptr_t carryin, uintptr_t *carryout)
 
 #if __arm64__
 
+// Pointer-size register prefix for inline asm
+# if __LP64__
+#   define p "x"  // true arm64
+# else
+#   define p "w"  // arm64_32
+# endif
+
 static ALWAYS_INLINE
 uintptr_t 
 LoadExclusive(uintptr_t *src)
 {
     uintptr_t result;
-    asm("ldxr %x0, [%x1]" 
+    asm("ldxr %" p "0, [%x1]" 
         : "=r" (result) 
         : "r" (src), "m" (*src));
     return result;
@@ -134,8 +158,8 @@ bool
 StoreExclusive(uintptr_t *dst, uintptr_t oldvalue __unused, uintptr_t value)
 {
     uint32_t result;
-    asm("stxr %w0, %x2, [%x3]" 
-        : "=r" (result), "=m" (*dst) 
+    asm("stxr %w0, %" p "2, [%x3]" 
+        : "=&r" (result), "=m" (*dst)
         : "r" (value), "r" (dst));
     return !result;
 }
@@ -146,12 +170,21 @@ bool
 StoreReleaseExclusive(uintptr_t *dst, uintptr_t oldvalue __unused, uintptr_t value)
 {
     uint32_t result;
-    asm("stlxr %w0, %x2, [%x3]" 
-        : "=r" (result), "=m" (*dst) 
+    asm("stlxr %w0, %" p "2, [%x3]" 
+        : "=&r" (result), "=m" (*dst)
         : "r" (value), "r" (dst));
     return !result;
 }
 
+static ALWAYS_INLINE
+void 
+ClearExclusive(uintptr_t *dst)
+{
+    // pretend it writes to *dst for instruction ordering purposes
+    asm("clrex" : "=m" (*dst));
+}
+
+#undef p
 
 #elif __arm__  
 
@@ -176,6 +209,12 @@ StoreReleaseExclusive(uintptr_t *dst, uintptr_t oldvalue, uintptr_t value)
 {
     return OSAtomicCompareAndSwapPtrBarrier((void *)oldvalue, (void *)value, 
                                             (void **)dst);
+}
+
+static ALWAYS_INLINE
+void 
+ClearExclusive(uintptr_t *dst __unused)
+{
 }
 
 
@@ -203,16 +242,16 @@ StoreReleaseExclusive(uintptr_t *dst, uintptr_t oldvalue, uintptr_t value)
     return StoreExclusive(dst, oldvalue, value);
 }
 
+static ALWAYS_INLINE
+void 
+ClearExclusive(uintptr_t *dst __unused)
+{
+}
+
+
 #else 
 #   error unknown architecture
 #endif
-
-
-#define spinlock_t os_lock_handoff_s
-#define spinlock_trylock(l) os_lock_trylock(l)
-#define spinlock_lock(l) os_lock_lock(l)
-#define spinlock_unlock(l) os_lock_unlock(l)
-#define SPINLOCK_INITIALIZER OS_LOCK_HANDOFF_INIT
 
 
 #if !TARGET_OS_IPHONE
@@ -222,7 +261,6 @@ StoreReleaseExclusive(uintptr_t *dst, uintptr_t oldvalue, uintptr_t value)
     __BEGIN_DECLS
     extern const char *CRSetCrashLogMessage(const char *msg);
     extern const char *CRGetCrashLogMessage(void);
-    extern const char *CRSetCrashLogMessage2(const char *msg);
     __END_DECLS
 #endif
 
@@ -299,9 +337,11 @@ StoreReleaseExclusive(uintptr_t *dst, uintptr_t oldvalue, uintptr_t value)
 #include <objc/objc.h>
 #include <objc/objc-api.h>
 
-__BEGIN_DECLS
-
-extern void _objc_fatal(const char *fmt, ...) __attribute__((noreturn, format (printf, 1, 2)));
+extern void _objc_fatal(const char *fmt, ...) 
+    __attribute__((noreturn, format (printf, 1, 2)));
+extern void _objc_fatal_with_reason(uint64_t reason, uint64_t flags, 
+                                    const char *fmt, ...) 
+    __attribute__((noreturn, format (printf, 3, 4)));
 
 #define INIT_ONCE_PTR(var, create, delete)                              \
     do {                                                                \
@@ -338,10 +378,7 @@ extern void _objc_fatal(const char *fmt, ...) __attribute__((noreturn, format (p
 #   define SYNC_COUNT_DIRECT_KEY ((tls_key_t)__PTK_FRAMEWORK_OBJC_KEY2)
 #   define AUTORELEASE_POOL_KEY  ((tls_key_t)__PTK_FRAMEWORK_OBJC_KEY3)
 # if SUPPORT_RETURN_AUTORELEASE
-#   define AUTORELEASE_POOL_RECLAIM_KEY ((tls_key_t)__PTK_FRAMEWORK_OBJC_KEY4)
-# endif
-# if SUPPORT_QOS_HACK
-#   define QOS_KEY               ((tls_key_t)__PTK_FRAMEWORK_OBJC_KEY5)
+#   define RETURN_DISPOSITION_KEY ((tls_key_t)__PTK_FRAMEWORK_OBJC_KEY4)
 # endif
 #else
 #   define SUPPORT_DIRECT_THREAD_KEYS 0
@@ -374,13 +411,6 @@ static __inline void *malloc_zone_realloc(malloc_zone_t z, void *p, size_t size)
 static __inline void malloc_zone_free(malloc_zone_t z, void *p) { free(p); }
 static __inline malloc_zone_t malloc_zone_from_ptr(const void *p) { return (malloc_zone_t)-1; }
 static __inline size_t malloc_size(const void *p) { return _msize((void*)p); /* fixme invalid pointer check? */ }
-
-
-// AssertMacros
-
-#define require_action_string(cond, dest, act, msg) do { if (!(cond)) { { act; } goto dest; } } while (0)
-#define require_noerr_string(err, dest, msg) do { if (err) goto dest; } while (0)
-#define require_string(cond, dest, msg) do { if (!(cond)) goto dest; } while (0)
 
 
 // OSAtomic
@@ -525,7 +555,7 @@ static inline int _monitor_enter_nodebug(monitor_t *c) {
     }
     return WaitForSingleObject(c->mutex, INFINITE);
 }
-static inline int _monitor_exit_nodebug(monitor_t *c) {
+static inline int _monitor_leave_nodebug(monitor_t *c) {
     if (!ReleaseMutex(c->mutex)) return MONITOR_NOT_ENTERED;
     else return 0;
 }
@@ -586,18 +616,6 @@ static inline int monitor_notifyAll(monitor_t *c) {
 }
 
 
-// fixme no rwlock yet
-
-#define rwlock_t mutex_t
-#define rwlock_init(r) mutex_init(r)
-#define _rwlock_read_nodebug(m) _mutex_lock_nodebug(m)
-#define _rwlock_write_nodebug(m) _mutex_lock_nodebug(m)
-#define _rwlock_try_read_nodebug(m) _mutex_try_lock_nodebug(m)
-#define _rwlock_try_write_nodebug(m) _mutex_try_lock_nodebug(m)
-#define _rwlock_unlock_read_nodebug(m) _mutex_unlock_nodebug(m)
-#define _rwlock_unlock_write_nodebug(m) _mutex_unlock_nodebug(m)
-
-
 typedef IMAGE_DOS_HEADER headerType;
 // fixme YES bundle? NO bundle? sometimes?
 #define headerIsBundle(hi) YES
@@ -627,6 +645,10 @@ OBJC_EXTERN IMAGE_DOS_HEADER __ImageBase;
 
 // OS compatibility
 
+static inline uint64_t nanoseconds() {
+    return mach_absolute_time();
+}
+
 // Internal data types
 
 typedef pthread_t objc_thread_t;
@@ -655,64 +677,17 @@ static inline void tls_set(tls_key_t k, void *value) {
 
 #if SUPPORT_DIRECT_THREAD_KEYS
 
-#if !NDEBUG
+#if DEBUG
 static bool is_valid_direct_key(tls_key_t k) {
     return (   k == SYNC_DATA_DIRECT_KEY
             || k == SYNC_COUNT_DIRECT_KEY
             || k == AUTORELEASE_POOL_KEY
 #   if SUPPORT_RETURN_AUTORELEASE
-            || k == AUTORELEASE_POOL_RECLAIM_KEY
-#   endif
-#   if SUPPORT_QOS_HACK
-            || k == QOS_KEY
+            || k == RETURN_DISPOSITION_KEY
 #   endif
                );
 }
 #endif
-
-#if __arm__
-
-// rdar://9162780  _pthread_get/setspecific_direct are inefficient
-// copied from libdispatch
-
-__attribute__((const))
-static ALWAYS_INLINE void**
-tls_base(void)
-{
-    uintptr_t p;
-#if defined(__arm__) && defined(_ARM_ARCH_6)
-    __asm__("mrc	p15, 0, %[p], c13, c0, 3" : [p] "=&r" (p));
-    return (void**)(p & ~0x3ul);
-#else
-#error tls_base not implemented
-#endif
-}
-
-
-static ALWAYS_INLINE void
-tls_set_direct(void **tsdb, tls_key_t k, void *v)
-{
-    assert(is_valid_direct_key(k));
-
-    tsdb[k] = v;
-}
-#define tls_set_direct(k, v)                    \
-        tls_set_direct(tls_base(), (k), (v))
-
-
-static ALWAYS_INLINE void *
-tls_get_direct(void **tsdb, tls_key_t k)
-{
-    assert(is_valid_direct_key(k));
-
-    return tsdb[k];
-}
-#define tls_get_direct(k)                       \
-        tls_get_direct(tls_base(), (k))
-
-// arm
-#else
-// not arm
 
 static inline void *tls_get_direct(tls_key_t k) 
 { 
@@ -735,9 +710,6 @@ static inline void tls_set_direct(tls_key_t k, void *value)
     }
 }
 
-// not arm
-#endif
-
 // SUPPORT_DIRECT_THREAD_KEYS
 #endif
 
@@ -754,83 +726,240 @@ static inline mach_port_t mach_thread_self_direct()
         _pthread_getspecific_direct(_PTHREAD_TSD_SLOT_MACH_THREAD_SELF);
 }
 
-#if SUPPORT_QOS_HACK
-static inline pthread_priority_t pthread_self_priority_direct() 
-{
-    pthread_priority_t pri = (pthread_priority_t)
-        _pthread_getspecific_direct(_PTHREAD_TSD_SLOT_PTHREAD_QOS_CLASS);
-    return pri & ~_PTHREAD_PRIORITY_FLAGS_MASK;
-}
+
+template <bool Debug> class mutex_tt;
+template <bool Debug> class monitor_tt;
+template <bool Debug> class recursive_mutex_tt;
+
+#if DEBUG
+#   define LOCKDEBUG 1
+#else
+#   define LOCKDEBUG 0
 #endif
 
+using spinlock_t = mutex_tt<LOCKDEBUG>;
+using mutex_t = mutex_tt<LOCKDEBUG>;
+using monitor_t = monitor_tt<LOCKDEBUG>;
+using recursive_mutex_t = recursive_mutex_tt<LOCKDEBUG>;
 
-typedef pthread_mutex_t mutex_t;
-#define MUTEX_INITIALIZER PTHREAD_MUTEX_INITIALIZER;
+// Use fork_unsafe_lock to get a lock that isn't 
+// acquired and released around fork().
+// All fork-safe locks are checked in debug builds.
+struct fork_unsafe_lock_t {
+    constexpr fork_unsafe_lock_t() = default;
+};
+extern const fork_unsafe_lock_t fork_unsafe_lock;
 
-static inline int _mutex_lock_nodebug(mutex_t *m) { 
-    return pthread_mutex_lock(m); 
-}
-static inline bool _mutex_try_lock_nodebug(mutex_t *m) { 
-    return !pthread_mutex_trylock(m); 
-}
-static inline int _mutex_unlock_nodebug(mutex_t *m) { 
-    return pthread_mutex_unlock(m); 
-}
+#include "objc-lockdebug.h"
+
+template <bool Debug>
+class mutex_tt : nocopy_t {
+    os_unfair_lock mLock;
+ public:
+    constexpr mutex_tt() : mLock(OS_UNFAIR_LOCK_INIT) {
+        lockdebug_remember_mutex(this);
+    }
+
+    constexpr mutex_tt(const fork_unsafe_lock_t unsafe) : mLock(OS_UNFAIR_LOCK_INIT) { }
+
+    void lock() {
+        lockdebug_mutex_lock(this);
+
+        os_unfair_lock_lock_with_options_inline
+            (&mLock, OS_UNFAIR_LOCK_DATA_SYNCHRONIZATION);
+    }
+
+    void unlock() {
+        lockdebug_mutex_unlock(this);
+
+        os_unfair_lock_unlock_inline(&mLock);
+    }
+
+    void forceReset() {
+        lockdebug_mutex_unlock(this);
+
+        bzero(&mLock, sizeof(mLock));
+        mLock = os_unfair_lock OS_UNFAIR_LOCK_INIT;
+    }
+
+    void assertLocked() {
+        lockdebug_mutex_assert_locked(this);
+    }
+
+    void assertUnlocked() {
+        lockdebug_mutex_assert_unlocked(this);
+    }
 
 
-typedef struct { 
-    pthread_mutex_t *mutex; 
-} recursive_mutex_t;
-#define RECURSIVE_MUTEX_INITIALIZER {0};
-#define RECURSIVE_MUTEX_NOT_LOCKED EPERM
-extern void recursive_mutex_init(recursive_mutex_t *m);
+    // Address-ordered lock discipline for a pair of locks.
 
-static inline int _recursive_mutex_lock_nodebug(recursive_mutex_t *m) { 
-    assert(m->mutex);
-    return pthread_mutex_lock(m->mutex); 
-}
-static inline bool _recursive_mutex_try_lock_nodebug(recursive_mutex_t *m) { 
-    assert(m->mutex);
-    return !pthread_mutex_trylock(m->mutex); 
-}
-static inline int _recursive_mutex_unlock_nodebug(recursive_mutex_t *m) { 
-    assert(m->mutex);
-    return pthread_mutex_unlock(m->mutex); 
-}
+    static void lockTwo(mutex_tt *lock1, mutex_tt *lock2) {
+        if (lock1 < lock2) {
+            lock1->lock();
+            lock2->lock();
+        } else {
+            lock2->lock();
+            if (lock2 != lock1) lock1->lock(); 
+        }
+    }
+
+    static void unlockTwo(mutex_tt *lock1, mutex_tt *lock2) {
+        lock1->unlock();
+        if (lock2 != lock1) lock2->unlock();
+    }
+
+    // Scoped lock and unlock
+    class locker : nocopy_t {
+        mutex_tt& lock;
+    public:
+        locker(mutex_tt& newLock) 
+            : lock(newLock) { lock.lock(); }
+        ~locker() { lock.unlock(); }
+    };
+
+    // Either scoped lock and unlock, or NOP.
+    class conditional_locker : nocopy_t {
+        mutex_tt& lock;
+        bool didLock;
+    public:
+        conditional_locker(mutex_tt& newLock, bool shouldLock)
+            : lock(newLock), didLock(shouldLock)
+        {
+            if (shouldLock) lock.lock();
+        }
+        ~conditional_locker() { if (didLock) lock.unlock(); }
+    };
+};
+
+using mutex_locker_t = mutex_tt<LOCKDEBUG>::locker;
+using conditional_mutex_locker_t = mutex_tt<LOCKDEBUG>::conditional_locker;
 
 
-typedef struct {
+template <bool Debug>
+class recursive_mutex_tt : nocopy_t {
+    os_unfair_recursive_lock mLock;
+
+  public:
+    constexpr recursive_mutex_tt() : mLock(OS_UNFAIR_RECURSIVE_LOCK_INIT) {
+        lockdebug_remember_recursive_mutex(this);
+    }
+
+    constexpr recursive_mutex_tt(const fork_unsafe_lock_t unsafe)
+        : mLock(OS_UNFAIR_RECURSIVE_LOCK_INIT)
+    { }
+
+    void lock()
+    {
+        lockdebug_recursive_mutex_lock(this);
+        os_unfair_recursive_lock_lock(&mLock);
+    }
+
+    void unlock()
+    {
+        lockdebug_recursive_mutex_unlock(this);
+
+        os_unfair_recursive_lock_unlock(&mLock);
+    }
+
+    void forceReset()
+    {
+        lockdebug_recursive_mutex_unlock(this);
+
+        bzero(&mLock, sizeof(mLock));
+        mLock = os_unfair_recursive_lock OS_UNFAIR_RECURSIVE_LOCK_INIT;
+    }
+
+    bool tryUnlock()
+    {
+        if (os_unfair_recursive_lock_tryunlock4objc(&mLock)) {
+            lockdebug_recursive_mutex_unlock(this);
+            return true;
+        }
+        return false;
+    }
+
+    void assertLocked() {
+        lockdebug_recursive_mutex_assert_locked(this);
+    }
+
+    void assertUnlocked() {
+        lockdebug_recursive_mutex_assert_unlocked(this);
+    }
+};
+
+
+template <bool Debug>
+class monitor_tt {
     pthread_mutex_t mutex;
     pthread_cond_t cond;
-} monitor_t;
-#define MONITOR_INITIALIZER { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER }
-#define MONITOR_NOT_ENTERED EPERM
 
-static inline int monitor_init(monitor_t *c) {
-    int err = pthread_mutex_init(&c->mutex, NULL);
-    if (err) return err;
-    err = pthread_cond_init(&c->cond, NULL);
-    if (err) {
-        pthread_mutex_destroy(&c->mutex);
-        return err;
+  public:
+    constexpr monitor_tt()
+        : mutex(PTHREAD_MUTEX_INITIALIZER), cond(PTHREAD_COND_INITIALIZER)
+    {
+        lockdebug_remember_monitor(this);
     }
-    return 0;
-}
-static inline int _monitor_enter_nodebug(monitor_t *c) {
-    return pthread_mutex_lock(&c->mutex);
-}
-static inline int _monitor_exit_nodebug(monitor_t *c) {
-    return pthread_mutex_unlock(&c->mutex);
-}
-static inline int _monitor_wait_nodebug(monitor_t *c) { 
-    return pthread_cond_wait(&c->cond, &c->mutex);
-}
-static inline int monitor_notify(monitor_t *c) { 
-    return pthread_cond_signal(&c->cond);
-}
-static inline int monitor_notifyAll(monitor_t *c) { 
-    return pthread_cond_broadcast(&c->cond);
-}
+
+    monitor_tt(const fork_unsafe_lock_t unsafe) 
+        : mutex(PTHREAD_MUTEX_INITIALIZER), cond(PTHREAD_COND_INITIALIZER)
+    { }
+
+    void enter() 
+    {
+        lockdebug_monitor_enter(this);
+
+        int err = pthread_mutex_lock(&mutex);
+        if (err) _objc_fatal("pthread_mutex_lock failed (%d)", err);
+    }
+
+    void leave() 
+    {
+        lockdebug_monitor_leave(this);
+
+        int err = pthread_mutex_unlock(&mutex);
+        if (err) _objc_fatal("pthread_mutex_unlock failed (%d)", err);
+    }
+
+    void wait() 
+    {
+        lockdebug_monitor_wait(this);
+
+        int err = pthread_cond_wait(&cond, &mutex);
+        if (err) _objc_fatal("pthread_cond_wait failed (%d)", err);
+    }
+
+    void notify() 
+    {
+        int err = pthread_cond_signal(&cond);
+        if (err) _objc_fatal("pthread_cond_signal failed (%d)", err);        
+    }
+
+    void notifyAll() 
+    {
+        int err = pthread_cond_broadcast(&cond);
+        if (err) _objc_fatal("pthread_cond_broadcast failed (%d)", err);        
+    }
+
+    void forceReset()
+    {
+        lockdebug_monitor_leave(this);
+        
+        bzero(&mutex, sizeof(mutex));
+        bzero(&cond, sizeof(cond));
+        mutex = pthread_mutex_t PTHREAD_MUTEX_INITIALIZER;
+        cond = pthread_cond_t PTHREAD_COND_INITIALIZER;
+    }
+
+    void assertLocked()
+    {
+        lockdebug_monitor_assert_locked(this);
+    }
+
+    void assertUnlocked()
+    {
+        lockdebug_monitor_assert_unlocked(this);
+    }
+};
 
 
 // semaphore_create formatted for INIT_ONCE use
@@ -844,137 +973,6 @@ static inline semaphore_t create_semaphore(void)
 }
 
 
-#if SUPPORT_QOS_HACK
-// Override QOS class to avoid priority inversion in rwlocks
-// <rdar://17697862> do a qos override before taking rw lock in objc
-
-#include <pthread/workqueue_private.h>
-extern pthread_priority_t BackgroundPriority;
-extern pthread_priority_t MainPriority;
-
-static inline void qosStartOverride()
-{
-    uintptr_t overrideRefCount = (uintptr_t)tls_get_direct(QOS_KEY);
-    if (overrideRefCount > 0) {
-        // If there is a qos override, increment the refcount and continue
-        tls_set_direct(QOS_KEY, (void *)(overrideRefCount + 1));
-    }
-    else {
-        pthread_priority_t currentPriority = pthread_self_priority_direct();
-        // Check if override is needed. Only override if we are background qos
-        if (currentPriority <= BackgroundPriority) {
-            int res __unused = _pthread_override_qos_class_start_direct(mach_thread_self_direct(), MainPriority);
-            assert(res == 0);
-            // Once we override, we set the reference count in the tsd 
-            // to know when to end the override
-            tls_set_direct(QOS_KEY, (void *)1);
-        }
-    }
-}
-
-static inline void qosEndOverride()
-{
-    uintptr_t overrideRefCount = (uintptr_t)tls_get_direct(QOS_KEY);
-    if (overrideRefCount == 0) return;
-
-    if (overrideRefCount == 1) {
-        // end the override
-        int res __unused = _pthread_override_qos_class_end_direct(mach_thread_self_direct());
-        assert(res == 0);
-    }
-
-    // decrement refcount
-    tls_set_direct(QOS_KEY, (void *)(overrideRefCount - 1));
-}
-
-// SUPPORT_QOS_HACK
-#else
-// not SUPPORT_QOS_HACK
-
-static inline void qosStartOverride() { }
-static inline void qosEndOverride() { }
-
-// not SUPPORT_QOS_HACK
-#endif
-
-/* Custom read-write lock
-   - reader is atomic add/subtract 
-   - writer is pthread mutex plus atomic add/subtract
-   - fairness: new readers wait if a writer wants in
-   - fairness: when writer completes, readers (probably) precede new writer
-
-   state: xxxxxxxx xxxxxxxx yyyyyyyy yyyyyyyz
-       x: blocked reader count
-       y: active reader count
-       z: readers allowed flag
-*/
-typedef struct {
-    pthread_rwlock_t rwl;
-} rwlock_t;
-
-static inline void rwlock_init(rwlock_t *l)
-{
-    int err __unused = pthread_rwlock_init(&l->rwl, NULL);
-    assert(err == 0);
-}
-
-static inline void _rwlock_read_nodebug(rwlock_t *l)
-{
-    qosStartOverride();
-    int err __unused = pthread_rwlock_rdlock(&l->rwl);
-    assert(err == 0);
-}
-
-static inline void _rwlock_unlock_read_nodebug(rwlock_t *l)
-{
-    int err __unused = pthread_rwlock_unlock(&l->rwl);
-    assert(err == 0);
-    qosEndOverride();
-}
-
-
-static inline bool _rwlock_try_read_nodebug(rwlock_t *l)
-{
-    qosStartOverride();
-    int err = pthread_rwlock_tryrdlock(&l->rwl);
-    assert(err == 0  ||  err == EBUSY  ||  err == EAGAIN);
-    if (err == 0) {
-        return true;
-    } else {
-        qosEndOverride();
-        return false;
-    }
-}
-
-
-static inline void _rwlock_write_nodebug(rwlock_t *l)
-{
-    qosStartOverride();
-    int err __unused = pthread_rwlock_wrlock(&l->rwl);
-    assert(err == 0);
-}
-
-static inline void _rwlock_unlock_write_nodebug(rwlock_t *l)
-{
-    int err __unused = pthread_rwlock_unlock(&l->rwl);
-    assert(err == 0);
-    qosEndOverride();
-}
-
-static inline bool _rwlock_try_write_nodebug(rwlock_t *l)
-{
-    qosStartOverride();
-    int err = pthread_rwlock_trywrlock(&l->rwl);
-    assert(err == 0  ||  err == EBUSY);
-    if (err == 0) {
-        return true;
-    } else {
-        qosEndOverride();
-        return false;
-    }
-}
-
-
 #ifndef __LP64__
 typedef struct mach_header headerType;
 typedef struct segment_command segmentType;
@@ -984,7 +982,7 @@ typedef struct mach_header_64 headerType;
 typedef struct segment_command_64 segmentType;
 typedef struct section_64 sectionType;
 #endif
-#define headerIsBundle(hi) (hi->mhdr->filetype == MH_BUNDLE)
+#define headerIsBundle(hi) (hi->mhdr()->filetype == MH_BUNDLE)
 #define libobjc_header ((headerType *)&_mh_dylib_header)
 
 // Prototypes
@@ -1001,6 +999,113 @@ extern int secure_open(const char *filename, int flags, uid_t euid);
 
 #endif
 
-__END_DECLS
+
+static inline void *
+memdup(const void *mem, size_t len)
+{
+    void *dup = malloc(len);
+    memcpy(dup, mem, len);
+    return dup;
+}
+
+// strdup that doesn't copy read-only memory
+static inline char *
+strdupIfMutable(const char *str)
+{
+    size_t size = strlen(str) + 1;
+    if (_dyld_is_memory_immutable(str, size)) {
+        return (char *)str;
+    } else {
+        return (char *)memdup(str, size);
+    }
+}
+
+// free strdupIfMutable() result
+static inline void
+freeIfMutable(char *str)
+{
+    size_t size = strlen(str) + 1;
+    if (_dyld_is_memory_immutable(str, size)) {
+        // nothing
+    } else {
+        free(str);
+    }
+}
+
+// nil-checking unsigned strdup
+static inline uint8_t *
+ustrdupMaybeNil(const uint8_t *str)
+{
+    if (!str) return nil;
+    return (uint8_t *)strdupIfMutable((char *)str);
+}
+
+// OS version checking:
+//
+// sdkVersion()
+// DYLD_OS_VERSION(mac, ios, tv, watch, bridge)
+// sdkIsOlderThan(mac, ios, tv, watch, bridge)
+// sdkIsAtLeast(mac, ios, tv, watch, bridge)
+// 
+// This version order matches OBJC_AVAILABLE.
+
+#if TARGET_OS_OSX
+#   define DYLD_OS_VERSION(x, i, t, w, b) DYLD_MACOSX_VERSION_##x
+#   define sdkVersion() dyld_get_program_sdk_version()
+
+#elif TARGET_OS_IOS
+#   define DYLD_OS_VERSION(x, i, t, w, b) DYLD_IOS_VERSION_##i
+#   define sdkVersion() dyld_get_program_sdk_version()
+
+#elif TARGET_OS_TV
+    // dyld does not currently have distinct constants for tvOS
+#   define DYLD_OS_VERSION(x, i, t, w, b) DYLD_IOS_VERSION_##t
+#   define sdkVersion() dyld_get_program_sdk_version()
+
+#elif TARGET_OS_BRIDGE
+#   if TARGET_OS_WATCH
+#       error bridgeOS 1.0 not supported
+#   endif
+    // fixme don't need bridgeOS versioning yet
+#   define DYLD_OS_VERSION(x, i, t, w, b) DYLD_IOS_VERSION_##t
+#   define sdkVersion() dyld_get_program_sdk_bridge_os_version()
+
+#elif TARGET_OS_WATCH
+#   define DYLD_OS_VERSION(x, i, t, w, b) DYLD_WATCHOS_VERSION_##w
+    // watchOS has its own API for compatibility reasons
+#   define sdkVersion() dyld_get_program_sdk_watch_os_version()
+
+#else
+#   error unknown OS
+#endif
+
+
+#define sdkIsOlderThan(x, i, t, w, b)                           \
+            (sdkVersion() < DYLD_OS_VERSION(x, i, t, w, b))
+#define sdkIsAtLeast(x, i, t, w, b)                             \
+            (sdkVersion() >= DYLD_OS_VERSION(x, i, t, w, b))
+
+// Allow bare 0 to be used in DYLD_OS_VERSION() and sdkIsOlderThan()
+#define DYLD_MACOSX_VERSION_0 0
+#define DYLD_IOS_VERSION_0 0
+#define DYLD_TVOS_VERSION_0 0
+#define DYLD_WATCHOS_VERSION_0 0
+#define DYLD_BRIDGEOS_VERSION_0 0
+
+// Pretty-print a DYLD_*_VERSION_* constant.
+#define SDK_FORMAT "%hu.%hhu.%hhu"
+#define FORMAT_SDK(v) \
+    (unsigned short)(((uint32_t)(v))>>16),  \
+    (unsigned  char)(((uint32_t)(v))>>8),   \
+    (unsigned  char)(((uint32_t)(v))>>0)
+
+// fork() safety requires careful tracking of all locks.
+// Our custom lock types check this in debug builds.
+// Disallow direct use of all other lock types.
+typedef __darwin_pthread_mutex_t pthread_mutex_t UNAVAILABLE_ATTRIBUTE;
+typedef __darwin_pthread_rwlock_t pthread_rwlock_t UNAVAILABLE_ATTRIBUTE;
+typedef int32_t OSSpinLock UNAVAILABLE_ATTRIBUTE;
+typedef struct os_unfair_lock_s os_unfair_lock UNAVAILABLE_ATTRIBUTE;
+
 
 #endif

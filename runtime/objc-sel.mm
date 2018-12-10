@@ -30,10 +30,6 @@
 static const objc_selopt_t *builtins = NULL;
 #endif
 
-#if SUPPORT_IGNORED_SELECTOR_CONSTANT
-#error sorry
-#endif
-
 
 static size_t SelrefCount = 0;
 
@@ -46,7 +42,7 @@ static SEL search_builtins(const char *key);
 * sel_init
 * Initialize selector tables and register selectors used internally.
 **********************************************************************/
-void sel_init(BOOL wantsGC, size_t selrefCount)
+void sel_init(size_t selrefCount)
 {
     // save this value for later
     SelrefCount = selrefCount;
@@ -68,16 +64,10 @@ void sel_init(BOOL wantsGC, size_t selrefCount)
 
     // Register selectors used by libobjc
 
-    if (wantsGC) {
-        // Registering retain/release/autorelease requires GC decision first.
-        // sel_init doesn't actually need the wantsGC parameter, it just 
-        // helps enforce the initialization order.
-    }
-
 #define s(x) SEL_##x = sel_registerNameNoLock(#x, NO)
 #define t(x,y) SEL_##y = sel_registerNameNoLock(#x, NO)
 
-    sel_lock();
+    mutex_locker_t lock(selLock);
 
     s(load);
     s(initialize);
@@ -94,14 +84,11 @@ void sel_init(BOOL wantsGC, size_t selrefCount)
     s(dealloc);
     s(copy);
     s(new);
-    s(finalize);
     t(forwardInvocation:, forwardInvocation);
     t(_tryRetain, tryRetain);
     t(_isDeallocating, isDeallocating);
     s(retainWeakReference);
     s(allowsWeakReference);
-
-    sel_unlock();
 
 #undef s
 #undef t
@@ -110,8 +97,8 @@ void sel_init(BOOL wantsGC, size_t selrefCount)
 
 static SEL sel_alloc(const char *name, bool copy)
 {
-    rwlock_assert_writing(&selLock);
-    return (SEL)(copy ? _strdup_internal(name) : name);    
+    selLock.assertLocked();
+    return (SEL)(copy ? strdupIfMutable(name) : name);    
 }
 
 
@@ -130,12 +117,11 @@ BOOL sel_isMapped(SEL sel)
 
     if (sel == search_builtins(name)) return YES;
 
-    bool result = false;
-    rwlock_read(&selLock);
-    if (namedSelectors) result = (sel == (SEL)NXMapGet(namedSelectors, name));
-    rwlock_unlock_read(&selLock);
-
-    return result;
+    mutex_locker_t lock(selLock);
+    if (namedSelectors) {
+        return (sel == (SEL)NXMapGet(namedSelectors, name));
+    }
+    return false;
 }
 
 
@@ -148,36 +134,29 @@ static SEL search_builtins(const char *name)
 }
 
 
-static SEL __sel_registerName(const char *name, int lock, int copy) 
+static SEL __sel_registerName(const char *name, bool shouldLock, bool copy) 
 {
     SEL result = 0;
 
-    if (lock) rwlock_assert_unlocked(&selLock);
-    else rwlock_assert_writing(&selLock);
+    if (shouldLock) selLock.assertUnlocked();
+    else selLock.assertLocked();
 
     if (!name) return (SEL)0;
 
     result = search_builtins(name);
     if (result) return result;
     
-    if (lock) rwlock_read(&selLock);
+    conditional_mutex_locker_t lock(selLock, shouldLock);
     if (namedSelectors) {
         result = (SEL)NXMapGet(namedSelectors, name);
     }
-    if (lock) rwlock_unlock_read(&selLock);
     if (result) return result;
 
     // No match. Insert.
 
-    if (lock) rwlock_write(&selLock);
-
     if (!namedSelectors) {
         namedSelectors = NXCreateMapTable(NXStrValueMapPrototype, 
                                           (unsigned)SelrefCount);
-    }
-    if (lock) {
-        // Rescan in case it was added while we dropped the lock
-        result = (SEL)NXMapGet(namedSelectors, name);
     }
     if (!result) {
         result = sel_alloc(name, copy);
@@ -185,7 +164,6 @@ static SEL __sel_registerName(const char *name, int lock, int copy)
         NXMapInsert(namedSelectors, sel_getName(result), result);
     }
 
-    if (lock) rwlock_unlock_write(&selLock);
     return result;
 }
 
@@ -194,18 +172,8 @@ SEL sel_registerName(const char *name) {
     return __sel_registerName(name, 1, 1);     // YES lock, YES copy
 }
 
-SEL sel_registerNameNoLock(const char *name, BOOL copy) {
+SEL sel_registerNameNoLock(const char *name, bool copy) {
     return __sel_registerName(name, 0, copy);  // NO lock, maybe copy
-}
-
-void sel_lock(void)
-{
-    rwlock_write(&selLock);
-}
-
-void sel_unlock(void)
-{
-    rwlock_unlock_write(&selLock);
 }
 
 
@@ -220,32 +188,7 @@ SEL sel_getUid(const char *name) {
 
 BOOL sel_isEqual(SEL lhs, SEL rhs)
 {
-    return (lhs == rhs) ? YES : NO;
-}
-
-
-/***********************************************************************
-* sel_preoptimizationValid
-* Return YES if this image's selector fixups are valid courtesy 
-* of the dyld shared cache.
-**********************************************************************/
-BOOL sel_preoptimizationValid(const header_info *hi)
-{
-#if !SUPPORT_PREOPT
-
-    return NO;
-
-#else
-
-    // preoptimization disabled for some reason
-    if (!isPreoptimized()) return NO;
-
-    // image not from shared cache, or not fixed inside shared cache
-    if (!_objcHeaderOptimizedByDyld(hi)) return NO;
-
-    return YES;
-
-#endif
+    return bool(lhs == rhs);
 }
 
 

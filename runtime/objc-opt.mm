@@ -39,9 +39,29 @@ bool isPreoptimized(void)
     return false;
 }
 
+bool noMissingWeakSuperclasses(void) 
+{
+    return false;
+}
+
+bool header_info::isPreoptimized() const
+{
+    return false;
+}
+
 objc_selopt_t *preoptimizedSelectors(void) 
 {
     return nil;
+}
+
+Protocol *getPreoptimizedProtocol(const char *name)
+{
+    return nil;
+}
+
+unsigned int getPreoptimizedClassUnreasonableCount()
+{
+    return 0;
 }
 
 Class getPreoptimizedClass(const char *name)
@@ -55,7 +75,17 @@ Class* copyPreoptimizedClasses(const char *name, int *outCount)
     return nil;
 }
 
+bool sharedRegionContains(const void *ptr)
+{
+    return false;
+}
+
 header_info *preoptimizedHinfoForHeader(const headerType *mhdr)
+{
+    return nil;
+}
+
+header_info_rw *getPreoptimizedHeaderRW(const struct header_info *const hdr)
 {
     return nil;
 }
@@ -77,8 +107,11 @@ void preopt_init(void)
 
 #include <objc-shared-cache.h>
 
+using objc_opt::objc_stringhash_offset_t;
+using objc_opt::objc_protocolopt_t;
 using objc_opt::objc_clsopt_t;
-using objc_opt::objc_headeropt_t;
+using objc_opt::objc_headeropt_ro_t;
+using objc_opt::objc_headeropt_rw_t;
 using objc_opt::objc_opt_t;
 
 __BEGIN_DECLS
@@ -88,19 +121,72 @@ __BEGIN_DECLS
 // opt is initialized to ~0 to detect incorrect use before preopt_init()
 
 static const objc_opt_t *opt = (objc_opt_t *)~0;
+static uintptr_t shared_cache_start;
+static uintptr_t shared_cache_end;
 static bool preoptimized;
 
 extern const objc_opt_t _objc_opt_data;  // in __TEXT, __objc_opt_ro
 
+/***********************************************************************
+* Return YES if we have a valid optimized shared cache.
+**********************************************************************/
 bool isPreoptimized(void) 
 {
     return preoptimized;
 }
 
+
+/***********************************************************************
+* Return YES if the shared cache does not have any classes with 
+* missing weak superclasses.
+**********************************************************************/
+bool noMissingWeakSuperclasses(void) 
+{
+    if (!preoptimized) return NO;  // might have missing weak superclasses
+    return opt->flags & objc_opt::NoMissingWeakSuperclasses;
+}
+
+
+/***********************************************************************
+* Return YES if this image's dyld shared cache optimizations are valid.
+**********************************************************************/
+bool header_info::isPreoptimized() const
+{
+    // preoptimization disabled for some reason
+    if (!preoptimized) return NO;
+
+    // image not from shared cache, or not fixed inside shared cache
+    if (!info()->optimizedByDyld()) return NO;
+
+    return YES;
+}
+
+
 objc_selopt_t *preoptimizedSelectors(void) 
 {
     return opt ? opt->selopt() : nil;
 }
+
+
+Protocol *getPreoptimizedProtocol(const char *name)
+{
+    objc_protocolopt_t *protocols = opt ? opt->protocolopt() : nil;
+    if (!protocols) return nil;
+
+    return (Protocol *)protocols->getProtocol(name);
+}
+
+
+unsigned int getPreoptimizedClassUnreasonableCount()
+{
+    objc_clsopt_t *classes = opt ? opt->clsopt() : nil;
+    if (!classes) return 0;
+    
+    // This is an overestimate: each set of duplicates 
+    // gets double-counted in `capacity` as well.
+    return classes->capacity + classes->duplicateCount();
+}
+
 
 Class getPreoptimizedClass(const char *name)
 {
@@ -110,7 +196,7 @@ Class getPreoptimizedClass(const char *name)
     void *cls;
     void *hi;
     uint32_t count = classes->getClassAndHeader(name, cls, hi);
-    if (count == 1  &&  ((header_info *)hi)->loaded) {
+    if (count == 1  &&  ((header_info *)hi)->isLoaded()) {
         // exactly one matching class, and its image is loaded
         return (Class)cls;
     } 
@@ -120,7 +206,7 @@ Class getPreoptimizedClass(const char *name)
         void *hilist[count];
         classes->getClassesAndHeaders(name, clslist, hilist);
         for (uint32_t i = 0; i < count; i++) {
-            if (((header_info *)hilist[i])->loaded) {
+            if (((header_info *)hilist[i])->isLoaded()) {
                 return (Class)clslist[i];
             }
         }
@@ -143,8 +229,8 @@ Class* copyPreoptimizedClasses(const char *name, int *outCount)
     uint32_t count = classes->getClassAndHeader(name, cls, hi);
     if (count == 0) return nil;
 
-    Class *result = (Class *)_calloc_internal(count, sizeof(Class));
-    if (count == 1  &&  ((header_info *)hi)->loaded) {
+    Class *result = (Class *)calloc(count, sizeof(Class));
+    if (count == 1  &&  ((header_info *)hi)->isLoaded()) {
         // exactly one matching class, and its image is loaded
         result[(*outCount)++] = (Class)cls;
         return result;
@@ -155,7 +241,7 @@ Class* copyPreoptimizedClasses(const char *name, int *outCount)
         void *hilist[count];
         classes->getClassesAndHeaders(name, clslist, hilist);
         for (uint32_t i = 0; i < count; i++) {
-            if (((header_info *)hilist[i])->loaded) {
+            if (((header_info *)hilist[i])->isLoaded()) {
                 result[(*outCount)++] = (Class)clslist[i];
             }
         }
@@ -172,8 +258,18 @@ Class* copyPreoptimizedClasses(const char *name, int *outCount)
     return nil;
 }
 
+/***********************************************************************
+* Return YES if the given pointer lies within the shared cache.
+* If the shared cache is not set up or is not valid,
+**********************************************************************/
+bool sharedRegionContains(const void *ptr)
+{
+    uintptr_t address = (uintptr_t)ptr;
+    return shared_cache_start <= address && address < shared_cache_end;
+}
+
 namespace objc_opt {
-struct objc_headeropt_t {
+struct objc_headeropt_ro_t {
     uint32_t count;
     uint32_t entsize;
     header_info headers[0];  // sorted by mhdr address
@@ -187,15 +283,15 @@ struct objc_headeropt_t {
         while (start <= end) {
             int32_t i = (start+end)/2;
             header_info *hi = headers+i;
-            if (mhdr == hi->mhdr) return hi;
-            else if (mhdr < hi->mhdr) end = i-1;
+            if (mhdr == hi->mhdr()) return hi;
+            else if (mhdr < hi->mhdr()) end = i-1;
             else start = i+1;
         }
 
-#if !NDEBUG
+#if DEBUG
         for (uint32_t i = 0; i < count; i++) {
             header_info *hi = headers+i;
-            if (mhdr == hi->mhdr) {
+            if (mhdr == hi->mhdr()) {
                 _objc_fatal("failed to find header %p (%d/%d)", 
                             mhdr, i, count);
             }
@@ -205,19 +301,59 @@ struct objc_headeropt_t {
         return nil;
     }
 };
+
+struct objc_headeropt_rw_t {
+    uint32_t count;
+    uint32_t entsize;
+    header_info_rw headers[0];  // sorted by mhdr address
+};
 };
 
 
 header_info *preoptimizedHinfoForHeader(const headerType *mhdr)
 {
-    objc_headeropt_t *hinfos = opt ? opt->headeropt() : nil;
+#if !__OBJC2__
+    // fixme old ABI shared cache doesn't prepare these properly
+    return nil;
+#endif
+
+    objc_headeropt_ro_t *hinfos = opt ? opt->headeropt_ro() : nil;
     if (hinfos) return hinfos->get(mhdr);
     else return nil;
 }
 
 
+header_info_rw *getPreoptimizedHeaderRW(const struct header_info *const hdr)
+{
+#if !__OBJC2__
+    // fixme old ABI shared cache doesn't prepare these properly
+    return nil;
+#endif
+    
+    objc_headeropt_ro_t *hinfoRO = opt ? opt->headeropt_ro() : nil;
+    objc_headeropt_rw_t *hinfoRW = opt ? opt->headeropt_rw() : nil;
+    if (!hinfoRO || !hinfoRW) {
+        _objc_fatal("preoptimized header_info missing for %s (%p %p %p)",
+                    hdr->fname(), hdr, hinfoRO, hinfoRW);
+    }
+    int32_t index = (int32_t)(hdr - hinfoRO->headers);
+    assert(hinfoRW->entsize == sizeof(header_info_rw));
+    return &hinfoRW->headers[index];
+}
+
+
 void preopt_init(void)
 {
+    // Get the memory region occupied by the shared cache.
+    size_t length;
+    const void *start = _dyld_get_shared_cache_range(&length);
+    if (start) {
+        shared_cache_start = (uintptr_t)start;
+        shared_cache_end = shared_cache_start + length;
+    } else {
+        shared_cache_start = shared_cache_end = 0;
+    }
+    
     // `opt` not set at compile time in order to detect too-early usage
     const char *failure = nil;
     opt = &_objc_opt_data;
@@ -234,19 +370,11 @@ void preopt_init(void)
         _objc_fatal("bad objc preopt version (want %d, got %d)", 
                     objc_opt::VERSION, opt->version);
     }
-    else if (!opt->selopt()  ||  !opt->headeropt()) {
+    else if (!opt->selopt()  ||  !opt->headeropt_ro()) {
         // One of the tables is missing. 
         failure = "(dyld shared cache is absent or out of date)";
     }
-#if SUPPORT_IGNORED_SELECTOR_CONSTANT
-    else if (UseGC) {
-        // GC is on, which renames some selectors
-        // Non-selector optimizations are still valid, but we don't have
-        // any of those yet
-        failure = "(GC is on)";
-    }
-#endif
-
+    
     if (failure) {
         // All preoptimized selector references are invalid.
         preoptimized = NO;

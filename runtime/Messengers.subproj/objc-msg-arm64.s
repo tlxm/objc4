@@ -27,104 +27,99 @@
  ********************************************************************/
 
 #ifdef __arm64__
-	
-#include <arm/arch.h>
 
+#include <arm/arch.h>
+#include "isa.h"
+#include "arm64-asm.h"
+
+.data
 
 // _objc_entryPoints and _objc_exitPoints are used by method dispatch
 // caching code to figure out whether any threads are actively 
 // in the cache for dispatching.  The labels surround the asm code
 // that do cache lookups.  The tables are zero-terminated.
-.data
+
+.align 4
 .private_extern _objc_entryPoints
 _objc_entryPoints:
-	.quad   _cache_getImp
-	.quad   _objc_msgSend
-	.quad   _objc_msgSendSuper
-	.quad   _objc_msgSendSuper2
-	.quad   0
+	PTR   _cache_getImp
+	PTR   _objc_msgSend
+	PTR   _objc_msgSendSuper
+	PTR   _objc_msgSendSuper2
+	PTR   _objc_msgLookup
+	PTR   _objc_msgLookupSuper2
+	PTR   0
 
-.data
 .private_extern _objc_exitPoints
 _objc_exitPoints:
-	.quad   LExit_cache_getImp
-	.quad   LExit_objc_msgSend
-	.quad   LExit_objc_msgSendSuper
-	.quad   LExit_objc_msgSendSuper2
-	.quad   0
-
-
-/********************************************************************
-* List every exit insn from every messenger for debugger use.
-* Format:
-* (
-*   1 word instruction's address
-*   1 word type (ENTER or FAST_EXIT or SLOW_EXIT or NIL_EXIT)
-* )
-* 1 word zero
-*
-* ENTER is the start of a dispatcher
-* FAST_EXIT is method dispatch
-* SLOW_EXIT is uncached method lookup
-* NIL_EXIT is returning zero from a message sent to nil
-* These must match objc-gdb.h.
-********************************************************************/
-	
-#define ENTER     1
-#define FAST_EXIT 2
-#define SLOW_EXIT 3
-#define NIL_EXIT  4
-
-.section __DATA,__objc_msg_break
-.globl _gdb_objc_messenger_breakpoints
-_gdb_objc_messenger_breakpoints:
-// contents populated by the macros below
-
-.macro MESSENGER_START
-4:
-	.section __DATA,__objc_msg_break
-	.quad 4b
-	.quad ENTER
-	.text
-.endmacro
-.macro MESSENGER_END_FAST
-4:
-	.section __DATA,__objc_msg_break
-	.quad 4b
-	.quad FAST_EXIT
-	.text
-.endmacro
-.macro MESSENGER_END_SLOW
-4:
-	.section __DATA,__objc_msg_break
-	.quad 4b
-	.quad SLOW_EXIT
-	.text
-.endmacro
-.macro MESSENGER_END_NIL
-4:
-	.section __DATA,__objc_msg_break
-	.quad 4b
-	.quad NIL_EXIT
-	.text
-.endmacro
+	PTR   LExit_cache_getImp
+	PTR   LExit_objc_msgSend
+	PTR   LExit_objc_msgSendSuper
+	PTR   LExit_objc_msgSendSuper2
+	PTR   LExit_objc_msgLookup
+	PTR   LExit_objc_msgLookupSuper2
+	PTR   0
 
 
 /* objc_super parameter to sendSuper */
 #define RECEIVER         0
-#define CLASS            8
+#define CLASS            __SIZEOF_POINTER__
 
 /* Selected field offsets in class structure */
-#define SUPERCLASS       8
-#define CACHE            16
-
-/* Selected field offsets in isa field */
-#define ISA_MASK         0x00000001fffffff8
+#define SUPERCLASS       __SIZEOF_POINTER__
+#define CACHE            (2 * __SIZEOF_POINTER__)
 
 /* Selected field offsets in method structure */
 #define METHOD_NAME      0
-#define METHOD_TYPES     8
-#define METHOD_IMP       16
+#define METHOD_TYPES     __SIZEOF_POINTER__
+#define METHOD_IMP       (2 * __SIZEOF_POINTER__)
+
+#define BUCKET_SIZE      (2 * __SIZEOF_POINTER__)
+
+
+/********************************************************************
+ * GetClassFromIsa_p16 src
+ * src is a raw isa field. Sets p16 to the corresponding class pointer.
+ * The raw isa might be an indexed isa to be decoded, or a
+ * packed isa that needs to be masked.
+ *
+ * On exit:
+ *   $0 is unchanged
+ *   p16 is a class pointer
+ *   x10 is clobbered
+ ********************************************************************/
+
+#if SUPPORT_INDEXED_ISA
+	.align 3
+	.globl _objc_indexed_classes
+_objc_indexed_classes:
+	.fill ISA_INDEX_COUNT, PTRSIZE, 0
+#endif
+
+.macro GetClassFromIsa_p16 /* src */
+
+#if SUPPORT_INDEXED_ISA
+	// Indexed isa
+	mov	p16, $0			// optimistically set dst = src
+	tbz	p16, #ISA_INDEX_IS_NPI_BIT, 1f	// done if not non-pointer isa
+	// isa in p16 is indexed
+	adrp	x10, _objc_indexed_classes@PAGE
+	add	x10, x10, _objc_indexed_classes@PAGEOFF
+	ubfx	p16, p16, #ISA_INDEX_SHIFT, #ISA_INDEX_BITS  // extract index
+	ldr	p16, [x10, p16, UXTP #PTRSHIFT]	// load class from array
+1:
+
+#elif __LP64__
+	// 64-bit packed isa
+	and	p16, $0, #ISA_MASK
+
+#else
+	// 32-bit raw isa
+	mov	p16, $0
+
+#endif
+
+.endmacro
 
 
 /********************************************************************
@@ -153,110 +148,172 @@ LExit$0:
 
 
 /********************************************************************
+ * UNWIND name, flags
+ * Unwind info generation	
+ ********************************************************************/
+.macro UNWIND
+	.section __LD,__compact_unwind,regular,debug
+	PTR $0
+	.set  LUnwind$0, LExit$0 - $0
+	.long LUnwind$0
+	.long $1
+	PTR 0	 /* no personality */
+	PTR 0  /* no LSDA */
+	.text
+.endmacro
+
+#define NoFrame 0x02000000  // no frame, no SP adjustment
+#define FrameWithNoSaves 0x04000000  // frame, no non-volatile saves
+
+
+/********************************************************************
  *
- * CacheLookup NORMAL|GETIMP
+ * CacheLookup NORMAL|GETIMP|LOOKUP
  * 
  * Locate the implementation for a selector in a class method cache.
  *
  * Takes:
  *	 x1 = selector
- *	 x9 = class to be searched
+ *	 x16 = class to be searched
  *
  * Kills:
- * 	 x10,x11,x12, x16,x17
+ * 	 x9,x10,x11,x12, x17
  *
- * On exit: (found) exits CacheLookup 
- *                  with x9 = class, x17 = IMP
+ * On exit: (found) calls or returns IMP
+ *                  with x16 = class, x17 = IMP
  *          (not found) jumps to LCacheMiss
  *
  ********************************************************************/
 
 #define NORMAL 0
 #define GETIMP 1
+#define LOOKUP 2
 
+// CacheHit: x17 = cached IMP, x12 = address of cached IMP
 .macro CacheHit
-	MESSENGER_END_FAST
 .if $0 == NORMAL
-	br	x17			// call imp
+	TailCallCachedImp x17, x12	// authenticate and call imp
+.elseif $0 == GETIMP
+	mov	p0, p17
+	AuthAndResignAsIMP x0, x12	// authenticate imp and re-sign as IMP
+	ret				// return IMP
+.elseif $0 == LOOKUP
+	AuthAndResignAsIMP x17, x12	// authenticate imp and re-sign as IMP
+	ret				// return imp via x17
 .else
-	b	LGetImpHit
+.abort oops
 .endif
 .endmacro
 
 .macro CheckMiss
-.if $0 == NORMAL			// miss if bucket->cls == 0
-	cbz	x16, __objc_msgSend_uncached_impcache
+	// miss if bucket->sel == 0
+.if $0 == GETIMP
+	cbz	p9, LGetImpMiss
+.elseif $0 == NORMAL
+	cbz	p9, __objc_msgSend_uncached
+.elseif $0 == LOOKUP
+	cbz	p9, __objc_msgLookup_uncached
 .else
-	cbz	x16, LGetImpMiss
+.abort oops
+.endif
+.endmacro
+
+.macro JumpMiss
+.if $0 == GETIMP
+	b	LGetImpMiss
+.elseif $0 == NORMAL
+	b	__objc_msgSend_uncached
+.elseif $0 == LOOKUP
+	b	__objc_msgLookup_uncached
+.else
+.abort oops
 .endif
 .endmacro
 
 .macro CacheLookup
-	// x1 = SEL, x9 = isa
-	ldp	x10, x11, [x9, #CACHE]	// x10 = buckets, x11 = occupied|mask
+	// p1 = SEL, p16 = isa
+	ldp	p10, p11, [x16, #CACHE]	// p10 = buckets, p11 = occupied|mask
+#if !__LP64__
+	and	w11, w11, 0xffff	// p11 = mask
+#endif
 	and	w12, w1, w11		// x12 = _cmd & mask
-	add	x12, x10, x12, LSL #4	// x12 = buckets + ((_cmd & mask)<<4)
+	add	p12, p10, p12, LSL #(1+PTRSHIFT)
+		             // p12 = buckets + ((_cmd & mask) << (1+PTRSHIFT))
 
-	ldp	x16, x17, [x12]		// {x16, x17} = *bucket
-1:	cmp	x16, x1			// if (bucket->sel != _cmd)
+	ldp	p17, p9, [x12]		// {imp, sel} = *bucket
+1:	cmp	p9, p1			// if (bucket->sel != _cmd)
 	b.ne	2f			//     scan more
 	CacheHit $0			// call or return imp
 	
-2:	// not hit: x12 = not-hit bucket
-	CheckMiss $0			// miss if bucket->cls == 0
-	cmp	x12, x10		// wrap if bucket == buckets
+2:	// not hit: p12 = not-hit bucket
+	CheckMiss $0			// miss if bucket->sel == 0
+	cmp	p12, p10		// wrap if bucket == buckets
 	b.eq	3f
-	ldp	x16, x17, [x12, #-16]!	// {x16, x17} = *--bucket
+	ldp	p17, p9, [x12, #-BUCKET_SIZE]!	// {imp, sel} = *--bucket
 	b	1b			// loop
 
-3:	// wrap: x12 = first bucket, w11 = mask
-	add	x12, x12, w11, UXTW #4	// x12 = buckets+(mask<<4)
+3:	// wrap: p12 = first bucket, w11 = mask
+	add	p12, p12, w11, UXTW #(1+PTRSHIFT)
+		                        // p12 = buckets + (mask << 1+PTRSHIFT)
 
-	// clone scanning loop to crash instead of hang when cache is corrupt
+	// Clone scanning loop to miss instead of hang when cache is corrupt.
+	// The slow path may detect any corruption and halt later.
 
-	ldp	x16, x17, [x12]		// {x16, x17} = *bucket
-1:	cmp	x16, x1			// if (bucket->sel != _cmd)
+	ldp	p17, p9, [x12]		// {imp, sel} = *bucket
+1:	cmp	p9, p1			// if (bucket->sel != _cmd)
 	b.ne	2f			//     scan more
 	CacheHit $0			// call or return imp
 	
-2:	// not hit: x12 = not-hit bucket
-	CheckMiss $0			// miss if bucket->cls == 0
-	cmp	x12, x10		// wrap if bucket == buckets
+2:	// not hit: p12 = not-hit bucket
+	CheckMiss $0			// miss if bucket->sel == 0
+	cmp	p12, p10		// wrap if bucket == buckets
 	b.eq	3f
-	ldp	x16, x17, [x12, #-16]!	// {x16, x17} = *--bucket
+	ldp	p17, p9, [x12, #-BUCKET_SIZE]!	// {imp, sel} = *--bucket
 	b	1b			// loop
 
-3:	// double wrap - busted
-					// x0 = receiver
-					// x1 = SEL
-	mov	x2, x9			// x2 = isa
-
-.if $0 == GETIMP
-	mov	x0, #0
-	b	_cache_getImp_corrupt_cache_error
-.else
-	b	_objc_msgSend_corrupt_cache_error
-.endif
-
+3:	// double wrap
+	JumpMiss $0
+	
 .endmacro
 
 
+/********************************************************************
+ *
+ * id objc_msgSend(id self, SEL _cmd, ...);
+ * IMP objc_msgLookup(id self, SEL _cmd, ...);
+ * 
+ * objc_msgLookup ABI:
+ * IMP returned in x17
+ * x16 reserved for our use but not used
+ *
+ ********************************************************************/
+
+#if SUPPORT_TAGGED_POINTERS
 	.data
 	.align 3
 	.globl _objc_debug_taggedpointer_classes
 _objc_debug_taggedpointer_classes:
 	.fill 16, 8, 0
+	.globl _objc_debug_taggedpointer_ext_classes
+_objc_debug_taggedpointer_ext_classes:
+	.fill 256, 8, 0
+#endif
 
 	ENTRY _objc_msgSend
-	MESSENGER_START
+	UNWIND _objc_msgSend, NoFrame
 
-	cmp	x0, #0			// nil check and tagged pointer check
+	cmp	p0, #0			// nil check and tagged pointer check
+#if SUPPORT_TAGGED_POINTERS
 	b.le	LNilOrTagged		//  (MSB tagged pointer looks negative)
-	ldr	x13, [x0]		// x13 = isa
-	and	x9, x13, #ISA_MASK	// x9 = class	
+#else
+	b.eq	LReturnZero
+#endif
+	ldr	p13, [x0]		// p13 = isa
+	GetClassFromIsa_p16 p13		// p16 = class
 LGetIsaDone:
 	CacheLookup NORMAL		// calls imp or objc_msgSend_uncached
 
+#if SUPPORT_TAGGED_POINTERS
 LNilOrTagged:
 	b.eq	LReturnZero		// nil check
 
@@ -264,8 +321,20 @@ LNilOrTagged:
 	adrp	x10, _objc_debug_taggedpointer_classes@PAGE
 	add	x10, x10, _objc_debug_taggedpointer_classes@PAGEOFF
 	ubfx	x11, x0, #60, #4
-	ldr	x9, [x10, x11, LSL #3]
+	ldr	x16, [x10, x11, LSL #3]
+	adrp	x10, _OBJC_CLASS_$___NSUnrecognizedTaggedPointer@PAGE
+	add	x10, x10, _OBJC_CLASS_$___NSUnrecognizedTaggedPointer@PAGEOFF
+	cmp	x10, x16
+	b.ne	LGetIsaDone
+
+	// ext tagged
+	adrp	x10, _objc_debug_taggedpointer_ext_classes@PAGE
+	add	x10, x10, _objc_debug_taggedpointer_ext_classes@PAGEOFF
+	ubfx	x11, x0, #52, #8
+	ldr	x16, [x10, x11, LSL #3]
 	b	LGetIsaDone
+// SUPPORT_TAGGED_POINTERS
+#endif
 
 LReturnZero:
 	// x0 is already zero
@@ -274,50 +343,104 @@ LReturnZero:
 	movi	d1, #0
 	movi	d2, #0
 	movi	d3, #0
-	MESSENGER_END_NIL
 	ret
 
 	END_ENTRY _objc_msgSend
 
 
-	ENTRY _objc_msgSendSuper
-	MESSENGER_START
+	ENTRY _objc_msgLookup
+	UNWIND _objc_msgLookup, NoFrame
+	cmp	p0, #0			// nil check and tagged pointer check
+#if SUPPORT_TAGGED_POINTERS
+	b.le	LLookup_NilOrTagged	//  (MSB tagged pointer looks negative)
+#else
+	b.eq	LLookup_Nil
+#endif
+	ldr	p13, [x0]		// p13 = isa
+	GetClassFromIsa_p16 p13		// p16 = class
+LLookup_GetIsaDone:
+	CacheLookup LOOKUP		// returns imp
 
-	ldr	x9, [x0, #CLASS]	// load class to search
-	ldr	x0, [x0, #RECEIVER]	// load real receiver
+#if SUPPORT_TAGGED_POINTERS
+LLookup_NilOrTagged:
+	b.eq	LLookup_Nil	// nil check
+
+	// tagged
+	mov	x10, #0xf000000000000000
+	cmp	x0, x10
+	b.hs	LLookup_ExtTag
+	adrp	x10, _objc_debug_taggedpointer_classes@PAGE
+	add	x10, x10, _objc_debug_taggedpointer_classes@PAGEOFF
+	ubfx	x11, x0, #60, #4
+	ldr	x16, [x10, x11, LSL #3]
+	b	LLookup_GetIsaDone
+
+LLookup_ExtTag:	
+	adrp	x10, _objc_debug_taggedpointer_ext_classes@PAGE
+	add	x10, x10, _objc_debug_taggedpointer_ext_classes@PAGEOFF
+	ubfx	x11, x0, #52, #8
+	ldr	x16, [x10, x11, LSL #3]
+	b	LLookup_GetIsaDone
+// SUPPORT_TAGGED_POINTERS
+#endif
+
+LLookup_Nil:
+	adrp	x17, __objc_msgNil@PAGE
+	add	x17, x17, __objc_msgNil@PAGEOFF
+	ret
+
+	END_ENTRY _objc_msgLookup
+
+	
+	STATIC_ENTRY __objc_msgNil
+
+	// x0 is already zero
+	mov	x1, #0
+	movi	d0, #0
+	movi	d1, #0
+	movi	d2, #0
+	movi	d3, #0
+	ret
+	
+	END_ENTRY __objc_msgNil
+
+
+	ENTRY _objc_msgSendSuper
+	UNWIND _objc_msgSendSuper, NoFrame
+
+	ldp	p0, p16, [x0]		// p0 = real receiver, p16 = class
 	CacheLookup NORMAL		// calls imp or objc_msgSend_uncached
 
 	END_ENTRY _objc_msgSendSuper
 
-	
-	ENTRY _objc_msgSendSuper2
-	MESSENGER_START
+	// no _objc_msgLookupSuper
 
-	ldr	x9, [x0, #CLASS]
-	ldr	x9, [x9, #SUPERCLASS]	// load class to search
-	ldr	x0, [x0, #RECEIVER]	// load real receiver
+	ENTRY _objc_msgSendSuper2
+	UNWIND _objc_msgSendSuper2, NoFrame
+
+	ldp	p0, p16, [x0]		// p0 = real receiver, p16 = class
+	ldr	p16, [x16, #SUPERCLASS]	// p16 = class->superclass
 	CacheLookup NORMAL
 
 	END_ENTRY _objc_msgSendSuper2
 
+	
+	ENTRY _objc_msgLookupSuper2
+	UNWIND _objc_msgLookupSuper2, NoFrame
 
-	ENTRY _objc_msgSend_noarg
-	b	_objc_msgSend
-	END_ENTRY _objc_msgSend_noarg
+	ldp	p0, p16, [x0]		// p0 = real receiver, p16 = class
+	ldr	p16, [x16, #SUPERCLASS]	// p16 = class->superclass
+	CacheLookup LOOKUP
+
+	END_ENTRY _objc_msgLookupSuper2
 
 
-	STATIC_ENTRY __objc_msgSend_uncached_impcache
-
-	// THIS IS NOT A CALLABLE C FUNCTION
-	// Out-of-band x9 is the class to search
-
-	MESSENGER_START
+.macro MethodTableLookup
 	
 	// push frame
+	SignLR
 	stp	fp, lr, [sp, #-16]!
 	mov	fp, sp
-
-	MESSENGER_END_SLOW
 
 	// save parameter registers: x0..x8, q0..q7
 	sub	sp, sp, #(10*8 + 8*16)
@@ -332,10 +455,10 @@ LReturnZero:
 	str	x8,     [sp, #(8*16+8*8)]
 
 	// receiver and selector already in x0 and x1
-	mov	x2, x9
+	mov	x2, x16
 	bl	__class_lookupMethodAndLoadCache3
 
-	// imp in x0
+	// IMP in x0
 	mov	x17, x0
 	
 	// restore registers and return
@@ -351,61 +474,41 @@ LReturnZero:
 
 	mov	sp, fp
 	ldp	fp, lr, [sp], #16
+	AuthenticateLR
+
+.endmacro
+
+	STATIC_ENTRY __objc_msgSend_uncached
+	UNWIND __objc_msgSend_uncached, FrameWithNoSaves
+
+	// THIS IS NOT A CALLABLE C FUNCTION
+	// Out-of-band p16 is the class to search
 	
-	br	x17
+	MethodTableLookup
+	TailCallFunctionPointer x17
 
-	END_ENTRY __objc_msgSend_uncached_impcache
+	END_ENTRY __objc_msgSend_uncached
 
 
-.section __LD,__compact_unwind,regular,debug
-	.quad _objc_msgSend
-	.set LUnwind_objc_msgSend, LExit_objc_msgSend-_objc_msgSend
-	.long LUnwind_objc_msgSend
-	.long 0x02000000  // no frame, no SP adjustment
-	.quad 0	 // no personality
-	.quad 0  // no LSDA
+	STATIC_ENTRY __objc_msgLookup_uncached
+	UNWIND __objc_msgLookup_uncached, FrameWithNoSaves
 
-.section __LD,__compact_unwind,regular,debug
-	.quad _objc_msgSendSuper
-	.set LUnwind_objc_msgSendSuper, LExit_objc_msgSendSuper-_objc_msgSendSuper
-	.long LUnwind_objc_msgSendSuper
-	.long 0x02000000 // no frame, no SP adjustment
-	.quad 0	 // no personality
-	.quad 0  // no LSDA
+	// THIS IS NOT A CALLABLE C FUNCTION
+	// Out-of-band p16 is the class to search
+	
+	MethodTableLookup
+	ret
 
-.section __LD,__compact_unwind,regular,debug
-	.quad _objc_msgSendSuper2
-	.set LUnwind_objc_msgSendSuper2, LExit_objc_msgSendSuper2-_objc_msgSendSuper2
-	.long LUnwind_objc_msgSendSuper2
-	.long 0x02000000  // no frame, no SP adjustment
-	.quad 0	 // no personality
-	.quad 0  // no LSDA
-
-.section __LD,__compact_unwind,regular,debug
-	.quad __objc_msgSend_uncached_impcache
-	.set LUnwind__objc_msgSend_uncached_impcache, LExit__objc_msgSend_uncached_impcache-__objc_msgSend_uncached_impcache
-	.long LUnwind__objc_msgSend_uncached_impcache
-	.long 0x04000000  // frame, no non-volatile registers saved
-	.quad 0	 // no personality
-	.quad 0  // no LSDA
+	END_ENTRY __objc_msgLookup_uncached
 
 
 	STATIC_ENTRY _cache_getImp
 
-	and	x9, x0, #ISA_MASK
+	GetClassFromIsa_p16 p0
 	CacheLookup GETIMP
 
-LGetImpHit:
-	// imp in x17
-	// don't return msgSend_uncached
-	adrp	x16, __objc_msgSend_uncached_impcache@PAGE
-	add	x16, x16, __objc_msgSend_uncached_impcache@PAGEOFF
-	cmp	x16, x17
-	csel	x0, x17, xzr, ne	// if imp!=uncached then imp else 0
-	ret
-
 LGetImpMiss:
-	mov	x0, #0
+	mov	p0, #0
 	ret
 
 	END_ENTRY _cache_getImp
@@ -424,10 +527,6 @@ LGetImpMiss:
 
 	STATIC_ENTRY __objc_msgForward_impcache
 
-	MESSENGER_START
-	nop
-	MESSENGER_END_SLOW
-
 	// No stret specialization.
 	b	__objc_msgForward
 
@@ -437,12 +536,16 @@ LGetImpMiss:
 	ENTRY __objc_msgForward
 
 	adrp	x17, __objc_forward_handler@PAGE
-	ldr	x17, [x17, __objc_forward_handler@PAGEOFF]
-	br	x17
+	ldr	p17, [x17, __objc_forward_handler@PAGEOFF]
+	TailCallFunctionPointer x17
 	
 	END_ENTRY __objc_msgForward
 	
 	
+	ENTRY _objc_msgSend_noarg
+	b	_objc_msgSend
+	END_ENTRY _objc_msgSend_noarg
+
 	ENTRY _objc_msgSend_debug
 	b	_objc_msgSend
 	END_ENTRY _objc_msgSend_debug
@@ -454,17 +557,10 @@ LGetImpMiss:
 	
 	ENTRY _method_invoke
 	// x1 is method triplet instead of SEL
-	ldr	x17, [x1, #METHOD_IMP]
-	ldr	x1, [x1, #METHOD_NAME]
-	br	x17
+	add	p16, p1, #METHOD_IMP
+	ldr	p17, [x16]
+	ldr	p1, [x1, #METHOD_NAME]
+	TailCallMethodListImp x17, x16
 	END_ENTRY _method_invoke
-
-
-	STATIC_ENTRY __objc_ignored_method
-
-	// self is already in x0
-	ret
-
-	END_ENTRY __objc_ignored_method
 
 #endif

@@ -122,10 +122,10 @@ namespace objc_references_support {
         }
 
         pointer allocate(size_type n, const_pointer = 0) {
-            return static_cast<pointer>(::_malloc_internal(n * sizeof(T)));
+            return static_cast<pointer>(::malloc(n * sizeof(T)));
         }
 
-        void deallocate(pointer p, size_type) { ::_free_internal(p); }
+        void deallocate(pointer p, size_type) { ::free(p); }
 
         size_type max_size() const { 
             return static_cast<size_type>(-1) / sizeof(T);
@@ -172,14 +172,14 @@ namespace objc_references_support {
     typedef ObjcAllocator<std::pair<void * const, ObjcAssociation> > ObjectAssociationMapAllocator;
     class ObjectAssociationMap : public std::map<void *, ObjcAssociation, ObjectPointerLess, ObjectAssociationMapAllocator> {
     public:
-        void *operator new(size_t n) { return ::_malloc_internal(n); }
-        void operator delete(void *ptr) { ::_free_internal(ptr); }
+        void *operator new(size_t n) { return ::malloc(n); }
+        void operator delete(void *ptr) { ::free(ptr); }
     };
     typedef ObjcAllocator<std::pair<const disguised_ptr_t, ObjectAssociationMap*> > AssociationsHashMapAllocator;
     class AssociationsHashMap : public unordered_map<disguised_ptr_t, ObjectAssociationMap *, DisguisedPointerHash, DisguisedPointerEqual, AssociationsHashMapAllocator> {
     public:
-        void *operator new(size_t n) { return ::_malloc_internal(n); }
-        void operator delete(void *ptr) { ::_free_internal(ptr); }
+        void *operator new(size_t n) { return ::malloc(n); }
+        void operator delete(void *ptr) { ::free(ptr); }
     };
 #endif
 }
@@ -187,15 +187,17 @@ namespace objc_references_support {
 using namespace objc_references_support;
 
 // class AssociationsManager manages a lock / hash table singleton pair.
-// Allocating an instance acquires the lock, and calling its assocations() method
-// lazily allocates it.
+// Allocating an instance acquires the lock, and calling its assocations()
+// method lazily allocates the hash table.
+
+spinlock_t AssociationsManagerLock;
 
 class AssociationsManager {
-    static spinlock_t _lock;
-    static AssociationsHashMap *_map;               // associative references:  object pointer -> PtrPtrHashMap.
+    // associative references: object pointer -> PtrPtrHashMap.
+    static AssociationsHashMap *_map;
 public:
-    AssociationsManager()   { spinlock_lock(&_lock); }
-    ~AssociationsManager()  { spinlock_unlock(&_lock); }
+    AssociationsManager()   { AssociationsManagerLock.lock(); }
+    ~AssociationsManager()  { AssociationsManagerLock.unlock(); }
     
     AssociationsHashMap &associations() {
         if (_map == NULL)
@@ -204,7 +206,6 @@ public:
     }
 };
 
-spinlock_t AssociationsManager::_lock = SPINLOCK_INITIALIZER;
 AssociationsHashMap *AssociationsManager::_map = NULL;
 
 // expanded policy bits.
@@ -233,12 +234,14 @@ id _object_get_associative_reference(id object, void *key) {
                 ObjcAssociation &entry = j->second;
                 value = entry.value();
                 policy = entry.policy();
-                if (policy & OBJC_ASSOCIATION_GETTER_RETAIN) ((id(*)(id, SEL))objc_msgSend)(value, SEL_retain);
+                if (policy & OBJC_ASSOCIATION_GETTER_RETAIN) {
+                    objc_retain(value);
+                }
             }
         }
     }
     if (value && (policy & OBJC_ASSOCIATION_GETTER_AUTORELEASE)) {
-        ((id(*)(id, SEL))objc_msgSend)(value, SEL_autorelease);
+        objc_autorelease(value);
     }
     return value;
 }
@@ -246,7 +249,7 @@ id _object_get_associative_reference(id object, void *key) {
 static id acquireValue(id value, uintptr_t policy) {
     switch (policy & 0xFF) {
     case OBJC_ASSOCIATION_SETTER_RETAIN:
-        return ((id(*)(id, SEL))objc_msgSend)(value, SEL_retain);
+        return objc_retain(value);
     case OBJC_ASSOCIATION_SETTER_COPY:
         return ((id(*)(id, SEL))objc_msgSend)(value, SEL_copy);
     }
@@ -255,7 +258,7 @@ static id acquireValue(id value, uintptr_t policy) {
 
 static void releaseValue(id value, uintptr_t policy) {
     if (policy & OBJC_ASSOCIATION_SETTER_RETAIN) {
-        ((id(*)(id, SEL))objc_msgSend)(value, SEL_release);
+        return objc_release(value);
     }
 }
 

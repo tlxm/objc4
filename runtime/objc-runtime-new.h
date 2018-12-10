@@ -24,8 +24,6 @@
 #ifndef _OBJC_RUNTIME_NEW_H
 #define _OBJC_RUNTIME_NEW_H
 
-__BEGIN_DECLS
-
 #if __LP64__
 typedef uint32_t mask_t;  // x86_64 & arm64 asm are less efficient with 16-bits
 #else
@@ -38,8 +36,15 @@ struct swift_class_t;
 
 struct bucket_t {
 private:
+    // IMP-first is better for arm64e ptrauth and no worse for arm64.
+    // SEL-first is better for armv7* and i386 and x86_64.
+#if __arm64__
+    MethodCacheIMP _imp;
     cache_key_t _key;
-    IMP _imp;
+#else
+    cache_key_t _key;
+    MethodCacheIMP _imp;
+#endif
 
 public:
     inline cache_key_t key() const { return _key; }
@@ -62,9 +67,10 @@ public:
     mask_t occupied();
     void incrementOccupied();
     void setBucketsAndMask(struct bucket_t *newBuckets, mask_t newMask);
-    void setEmpty();
+    void initializeToEmpty();
 
     mask_t capacity();
+    bool isConstantEmptyCache();
     bool canBeFreed();
 
     static size_t bytesForCapacity(uint32_t cap);
@@ -72,7 +78,7 @@ public:
 
     void expand();
     void reallocate(mask_t oldCapacity, mask_t newCapacity);
-    struct bucket_t * find(cache_key_t key);
+    struct bucket_t * find(cache_key_t key, id receiver);
 
     static void bad_cache(id receiver, SEL sel, Class isa) __attribute__((noreturn));
 };
@@ -81,10 +87,142 @@ public:
 // classref_t is unremapped class_t*
 typedef struct classref * classref_t;
 
+/***********************************************************************
+* entsize_list_tt<Element, List, FlagMask>
+* Generic implementation of an array of non-fragile structs.
+*
+* Element is the struct type (e.g. method_t)
+* List is the specialization of entsize_list_tt (e.g. method_list_t)
+* FlagMask is used to stash extra bits in the entsize field
+*   (e.g. method list fixup markers)
+**********************************************************************/
+template <typename Element, typename List, uint32_t FlagMask>
+struct entsize_list_tt {
+    uint32_t entsizeAndFlags;
+    uint32_t count;
+    Element first;
+
+    uint32_t entsize() const {
+        return entsizeAndFlags & ~FlagMask;
+    }
+    uint32_t flags() const {
+        return entsizeAndFlags & FlagMask;
+    }
+
+    Element& getOrEnd(uint32_t i) const { 
+        assert(i <= count);
+        return *(Element *)((uint8_t *)&first + i*entsize()); 
+    }
+    Element& get(uint32_t i) const { 
+        assert(i < count);
+        return getOrEnd(i);
+    }
+
+    size_t byteSize() const {
+        return byteSize(entsize(), count);
+    }
+    
+    static size_t byteSize(uint32_t entsize, uint32_t count) {
+        return sizeof(entsize_list_tt) + (count-1)*entsize;
+    }
+
+    List *duplicate() const {
+        auto *dup = (List *)calloc(this->byteSize(), 1);
+        dup->entsizeAndFlags = this->entsizeAndFlags;
+        dup->count = this->count;
+        std::copy(begin(), end(), dup->begin());
+        return dup;
+    }
+
+    struct iterator;
+    const iterator begin() const { 
+        return iterator(*static_cast<const List*>(this), 0); 
+    }
+    iterator begin() { 
+        return iterator(*static_cast<const List*>(this), 0); 
+    }
+    const iterator end() const { 
+        return iterator(*static_cast<const List*>(this), count); 
+    }
+    iterator end() { 
+        return iterator(*static_cast<const List*>(this), count); 
+    }
+
+    struct iterator {
+        uint32_t entsize;
+        uint32_t index;  // keeping track of this saves a divide in operator-
+        Element* element;
+
+        typedef std::random_access_iterator_tag iterator_category;
+        typedef Element value_type;
+        typedef ptrdiff_t difference_type;
+        typedef Element* pointer;
+        typedef Element& reference;
+
+        iterator() { }
+
+        iterator(const List& list, uint32_t start = 0)
+            : entsize(list.entsize())
+            , index(start)
+            , element(&list.getOrEnd(start))
+        { }
+
+        const iterator& operator += (ptrdiff_t delta) {
+            element = (Element*)((uint8_t *)element + delta*entsize);
+            index += (int32_t)delta;
+            return *this;
+        }
+        const iterator& operator -= (ptrdiff_t delta) {
+            element = (Element*)((uint8_t *)element - delta*entsize);
+            index -= (int32_t)delta;
+            return *this;
+        }
+        const iterator operator + (ptrdiff_t delta) const {
+            return iterator(*this) += delta;
+        }
+        const iterator operator - (ptrdiff_t delta) const {
+            return iterator(*this) -= delta;
+        }
+
+        iterator& operator ++ () { *this += 1; return *this; }
+        iterator& operator -- () { *this -= 1; return *this; }
+        iterator operator ++ (int) {
+            iterator result(*this); *this += 1; return result;
+        }
+        iterator operator -- (int) {
+            iterator result(*this); *this -= 1; return result;
+        }
+
+        ptrdiff_t operator - (const iterator& rhs) const {
+            return (ptrdiff_t)this->index - (ptrdiff_t)rhs.index;
+        }
+
+        Element& operator * () const { return *element; }
+        Element* operator -> () const { return element; }
+
+        operator Element& () const { return *element; }
+
+        bool operator == (const iterator& rhs) const {
+            return this->element == rhs.element;
+        }
+        bool operator != (const iterator& rhs) const {
+            return this->element != rhs.element;
+        }
+
+        bool operator < (const iterator& rhs) const {
+            return this->element < rhs.element;
+        }
+        bool operator > (const iterator& rhs) const {
+            return this->element > rhs.element;
+        }
+    };
+};
+
+
 struct method_t {
     SEL name;
     const char *types;
-    IMP imp;
+    MethodListIMP imp;
 
     struct SortBySELAddress :
         public std::binary_function<const method_t&,
@@ -94,102 +232,6 @@ struct method_t {
                          const method_t& rhs)
         { return lhs.name < rhs.name; }
     };
-};
-
-struct method_list_t {
-    uint32_t entsize_NEVER_USE;  // high bits used for fixup markers
-    uint32_t count;
-    method_t first;
-
-    uint32_t getEntsize() const { 
-        return entsize_NEVER_USE & ~(uint32_t)3; 
-    }
-    uint32_t getCount() const { 
-        return count; 
-    }
-    method_t& getOrEnd(uint32_t i) const { 
-        assert(i <= count);
-        return *(method_t *)((uint8_t *)&first + i*getEntsize()); 
-    }
-    method_t& get(uint32_t i) const { 
-        assert(i < count);
-        return getOrEnd(i);
-    }
-
-    // iterate methods, taking entsize into account
-    // fixme need a proper const_iterator
-    struct method_iterator {
-        uint32_t entsize;
-        uint32_t index;  // keeping track of this saves a divide in operator-
-        method_t* method;
-
-        typedef std::random_access_iterator_tag iterator_category;
-        typedef method_t value_type;
-        typedef ptrdiff_t difference_type;
-        typedef method_t* pointer;
-        typedef method_t& reference;
-
-        method_iterator() { }
-
-        method_iterator(const method_list_t& mlist, uint32_t start = 0)
-            : entsize(mlist.getEntsize())
-            , index(start)
-            , method(&mlist.getOrEnd(start))
-        { }
-
-        const method_iterator& operator += (ptrdiff_t delta) {
-            method = (method_t*)((uint8_t *)method + delta*entsize);
-            index += (int32_t)delta;
-            return *this;
-        }
-        const method_iterator& operator -= (ptrdiff_t delta) {
-            method = (method_t*)((uint8_t *)method - delta*entsize);
-            index -= (int32_t)delta;
-            return *this;
-        }
-        const method_iterator operator + (ptrdiff_t delta) const {
-            return method_iterator(*this) += delta;
-        }
-        const method_iterator operator - (ptrdiff_t delta) const {
-            return method_iterator(*this) -= delta;
-        }
-
-        method_iterator& operator ++ () { *this += 1; return *this; }
-        method_iterator& operator -- () { *this -= 1; return *this; }
-        method_iterator operator ++ (int) {
-            method_iterator result(*this); *this += 1; return result;
-        }
-        method_iterator operator -- (int) {
-            method_iterator result(*this); *this -= 1; return result;
-        }
-
-        ptrdiff_t operator - (const method_iterator& rhs) const {
-            return (ptrdiff_t)this->index - (ptrdiff_t)rhs.index;
-        }
-
-        method_t& operator * () const { return *method; }
-        method_t* operator -> () const { return method; }
-
-        operator method_t& () const { return *method; }
-
-        bool operator == (const method_iterator& rhs) {
-            return this->method == rhs.method;
-        }
-        bool operator != (const method_iterator& rhs) {
-            return this->method != rhs.method;
-        }
-
-        bool operator < (const method_iterator& rhs) {
-            return this->method < rhs.method;
-        }
-        bool operator > (const method_iterator& rhs) {
-            return this->method > rhs.method;
-        }
-    };
-
-    method_iterator begin() const { return method_iterator(*this, 0); }
-    method_iterator end() const { return method_iterator(*this, getCount()); }
-
 };
 
 struct ivar_t {
@@ -208,16 +250,10 @@ struct ivar_t {
     uint32_t alignment_raw;
     uint32_t size;
 
-    uint32_t alignment() {
+    uint32_t alignment() const {
         if (alignment_raw == ~(uint32_t)0) return 1U << WORD_SHIFT;
         return 1 << alignment_raw;
     }
-};
-
-struct ivar_list_t {
-    uint32_t entsize;
-    uint32_t count;
-    ivar_t first;
 };
 
 struct property_t {
@@ -225,15 +261,37 @@ struct property_t {
     const char *attributes;
 };
 
-struct property_list_t {
-    uint32_t entsize;
-    uint32_t count;
-    property_t first;
+// Two bits of entsize are used for fixup markers.
+struct method_list_t : entsize_list_tt<method_t, method_list_t, 0x3> {
+    bool isFixedUp() const;
+    void setFixedUp();
+
+    uint32_t indexOfMethod(const method_t *meth) const {
+        uint32_t i = 
+            (uint32_t)(((uintptr_t)meth - (uintptr_t)this) / entsize());
+        assert(i < count);
+        return i;
+    }
 };
+
+struct ivar_list_t : entsize_list_tt<ivar_t, ivar_list_t, 0> {
+    bool containsIvar(Ivar ivar) const {
+        return (ivar >= (Ivar)&*begin()  &&  ivar < (Ivar)&*end());
+    }
+};
+
+struct property_list_t : entsize_list_tt<property_t, property_list_t, 0> {
+};
+
 
 typedef uintptr_t protocol_ref_t;  // protocol_t *, but unremapped
 
-#define PROTOCOL_FIXED_UP (1<<31)  // must never be set by compiler
+// Values for protocol_t->flags
+#define PROTOCOL_FIXED_UP_2 (1<<31)  // must never be set by compiler
+#define PROTOCOL_FIXED_UP_1 (1<<30)  // must never be set by compiler
+// Bits 0..15 are reserved for Swift's use.
+
+#define PROTOCOL_FIXED_UP_MASK (PROTOCOL_FIXED_UP_1 | PROTOCOL_FIXED_UP_2)
 
 struct protocol_t : objc_object {
     const char *mangledName;
@@ -245,11 +303,10 @@ struct protocol_t : objc_object {
     property_list_t *instanceProperties;
     uint32_t size;   // sizeof(protocol_t)
     uint32_t flags;
-    const char **extendedMethodTypes;
-
-    // Fields below this point are allocated at runtime 
-    // and are not present on disk.
+    // Fields below this point are not always present on disk.
+    const char **_extendedMethodTypes;
     const char *_demangledName;
+    property_list_t *_classProperties;
 
     const char *demangledName();
 
@@ -257,16 +314,29 @@ struct protocol_t : objc_object {
         return demangledName();
     }
 
-    bool isFixedUp() const {
-        return flags & PROTOCOL_FIXED_UP;
-    }
+    bool isFixedUp() const;
+    void setFixedUp();
+
+#   define HAS_FIELD(f) (size >= offsetof(protocol_t, f) + sizeof(f))
 
     bool hasExtendedMethodTypesField() const {
-        return size >= (offsetof(protocol_t, extendedMethodTypes) 
-                        + sizeof(extendedMethodTypes));
+        return HAS_FIELD(_extendedMethodTypes);
     }
-    bool hasExtendedMethodTypes() const {
-        return hasExtendedMethodTypesField() && extendedMethodTypes;
+    bool hasDemangledNameField() const {
+        return HAS_FIELD(_demangledName);
+    }
+    bool hasClassPropertiesField() const {
+        return HAS_FIELD(_classProperties);
+    }
+
+#   undef HAS_FIELD
+
+    const char **extendedMethodTypes() const {
+        return hasExtendedMethodTypesField() ? _extendedMethodTypes : nil;
+    }
+
+    property_list_t *classProperties() const {
+        return hasClassPropertiesField() ? _classProperties : nil;
     }
 };
 
@@ -274,66 +344,43 @@ struct protocol_list_t {
     // count is 64-bit by accident. 
     uintptr_t count;
     protocol_ref_t list[0]; // variable-size
+
+    size_t byteSize() const {
+        return sizeof(*this) + count*sizeof(list[0]);
+    }
+
+    protocol_list_t *duplicate() const {
+        return (protocol_list_t *)memdup(this, this->byteSize());
+    }
+
+    typedef protocol_ref_t* iterator;
+    typedef const protocol_ref_t* const_iterator;
+
+    const_iterator begin() const {
+        return list;
+    }
+    iterator begin() {
+        return list;
+    }
+    const_iterator end() const {
+        return list + count;
+    }
+    iterator end() {
+        return list + count;
+    }
 };
 
-struct class_ro_t {
-    uint32_t flags;
-    uint32_t instanceStart;
-    uint32_t instanceSize;
-#ifdef __LP64__
+struct locstamped_category_t {
+    category_t *cat;
+    struct header_info *hi;
+};
+
+struct locstamped_category_list_t {
+    uint32_t count;
+#if __LP64__
     uint32_t reserved;
 #endif
-
-    const uint8_t * ivarLayout;
-    
-    const char * name;
-    const method_list_t * baseMethods;
-    const protocol_list_t * baseProtocols;
-    const ivar_list_t * ivars;
-
-    const uint8_t * weakIvarLayout;
-    const property_list_t *baseProperties;
-};
-
-struct class_rw_t {
-    uint32_t flags;
-    uint32_t version;
-
-    const class_ro_t *ro;
-
-    union {
-        method_list_t **method_lists;  // RW_METHOD_ARRAY == 1
-        method_list_t *method_list;    // RW_METHOD_ARRAY == 0
-    };
-    struct chained_property_list *properties;
-    const protocol_list_t ** protocols;
-
-    Class firstSubclass;
-    Class nextSiblingClass;
-
-    char *demangledName;
-
-    void setFlags(uint32_t set) 
-    {
-        OSAtomicOr32Barrier(set, &flags);
-    }
-
-    void clearFlags(uint32_t clear) 
-    {
-        OSAtomicXor32Barrier(clear, &flags);
-    }
-
-    // set and clear must not overlap
-    void changeFlags(uint32_t set, uint32_t clear) 
-    {
-        assert((set & clear) == 0);
-
-        uint32_t oldf, newf;
-        do {
-            oldf = flags;
-            newf = (oldf | set) & ~clear;
-        } while (!OSAtomicCompareAndSwap32Barrier(oldf, newf, (volatile int32_t *)&flags));
-    }
+    locstamped_category_t list[0];
 };
 
 
@@ -341,7 +388,8 @@ struct class_rw_t {
 // The extra bits are optimized for the retain/release and alloc/dealloc paths.
 
 // Values for class_ro_t->flags
-// These are emitted by the compiler and are part of the ABI. 
+// These are emitted by the compiler and are part of the ABI.
+// Note: See CGObjCNonFragileABIMac::BuildClassRoTInitializer in clang
 // class is a metaclass
 #define RO_META               (1<<0)
 // class is a root class
@@ -356,10 +404,12 @@ struct class_rw_t {
 #define RO_EXCEPTION          (1<<5)
 // this bit is available for reassignment
 // #define RO_REUSE_ME           (1<<6) 
-// class compiled with -fobjc-arc (automatic retain/release)
-#define RO_IS_ARR             (1<<7)
+// class compiled with ARC
+#define RO_IS_ARC             (1<<7)
 // class has .cxx_destruct but no .cxx_construct (with RO_HAS_CXX_STRUCTORS)
 #define RO_HAS_CXX_DTOR_ONLY  (1<<8)
+// class is not ARC but has ARC-style weak ivar layout 
+#define RO_HAS_WEAK_WITHOUT_ARC (1<<9)
 
 // class is in an unloadable bundle - must never be set by compiler
 #define RO_FROM_BUNDLE        (1<<29)
@@ -385,8 +435,8 @@ struct class_rw_t {
 #define RW_CONSTRUCTING       (1<<26)
 // class allocated and registered
 #define RW_CONSTRUCTED        (1<<25)
-// GC:  class has unsafe finalize method
-#define RW_FINALIZE_ON_MAIN_THREAD (1<<24)
+// available for use; was RW_FINALIZE_ON_MAIN_THREAD
+// #define RW_24 (1<<24)
 // class +load has been called
 #define RW_LOADED             (1<<23)
 #if !SUPPORT_NONPOINTER_ISA
@@ -395,8 +445,8 @@ struct class_rw_t {
 #endif
 // class has instance-specific GC layout
 #define RW_HAS_INSTANCE_SPECIFIC_LAYOUT (1 << 21)
-// class's method list is an array of method lists
-#define RW_METHOD_ARRAY       (1<<20)
+// available for use
+// #define RW_20       (1<<20)
 // class has started realizing but not yet completed it
 #define RW_REALIZING          (1<<19)
 
@@ -417,14 +467,17 @@ struct class_rw_t {
 // Note this is is stored in the metaclass.
 #define RW_HAS_DEFAULT_AWZ    (1<<16)
 // class's instances requires raw isa
-// not tracked for 32-bit because it only applies to non-pointer isa
-// #define RW_REQUIRES_RAW_ISA
-
-// class is a Swift class
-#define FAST_IS_SWIFT         (1UL<<0)
+#if SUPPORT_NONPOINTER_ISA
+#define RW_REQUIRES_RAW_ISA   (1<<15)
+#endif
 // class or superclass has default retain/release/autorelease/retainCount/
 //   _tryRetain/_isDeallocating/retainWeakReference/allowsWeakReference
-#define FAST_HAS_DEFAULT_RR   (1UL<<1)
+#define RW_HAS_DEFAULT_RR     (1<<14)
+
+// class is a Swift class from the pre-stable Swift ABI
+#define FAST_IS_SWIFT_LEGACY  (1UL<<0)
+// class is a Swift class from the stable Swift ABI
+#define FAST_IS_SWIFT_STABLE  (1UL<<1)
 // data pointer
 #define FAST_DATA_MASK        0xfffffffcUL
 
@@ -438,27 +491,29 @@ struct class_rw_t {
 // class or superclass has default alloc/allocWithZone: implementation
 // Note this is is stored in the metaclass.
 #define RW_HAS_DEFAULT_AWZ    (1<<16)
+// class's instances requires raw isa
+#define RW_REQUIRES_RAW_ISA   (1<<15)
 
-// class is a Swift class
-#define FAST_IS_SWIFT           (1UL<<0)
+// class is a Swift class from the pre-stable Swift ABI
+#define FAST_IS_SWIFT_LEGACY    (1UL<<0)
+// class is a Swift class from the stable Swift ABI
+#define FAST_IS_SWIFT_STABLE    (1UL<<1)
 // class or superclass has default retain/release/autorelease/retainCount/
 //   _tryRetain/_isDeallocating/retainWeakReference/allowsWeakReference
-#define FAST_HAS_DEFAULT_RR     (1UL<<1)
-// class's instances requires raw isa
-#define FAST_REQUIRES_RAW_ISA   (1UL<<2)
+#define FAST_HAS_DEFAULT_RR     (1UL<<2)
 // data pointer
 #define FAST_DATA_MASK          0x00007ffffffffff8UL
 
 #else
 // Leaks-incompatible version that steals lots of bits.
 
-// class is a Swift class
-#define FAST_IS_SWIFT           (1UL<<0)
-// class's instances requires raw isa
-#define FAST_REQUIRES_RAW_ISA   (1UL<<1)
-// class or superclass has .cxx_destruct implementation
-//   This bit is aligned with isa_t->hasCxxDtor to save an instruction.
-#define FAST_HAS_CXX_DTOR       (1UL<<2)
+// class is a Swift class from the pre-stable Swift ABI
+#define FAST_IS_SWIFT_LEGACY    (1UL<<0)
+// class is a Swift class from the stable Swift ABI
+#define FAST_IS_SWIFT_STABLE    (1UL<<1)
+// summary bit for fast alloc path: !hasCxxCtor and 
+//   !instancesRequireRawIsa and instanceSize fits into shiftedSize
+#define FAST_ALLOC              (1UL<<2)
 // data pointer
 #define FAST_DATA_MASK          0x00007ffffffffff8UL
 // class or superclass has .cxx_construct implementation
@@ -469,13 +524,15 @@ struct class_rw_t {
 // class or superclass has default retain/release/autorelease/retainCount/
 //   _tryRetain/_isDeallocating/retainWeakReference/allowsWeakReference
 #define FAST_HAS_DEFAULT_RR     (1UL<<49)
-// summary bit for fast alloc path: !hasCxxCtor and 
-//   !requiresRawIsa and instanceSize fits into shiftedSize
-#define FAST_ALLOC              (1UL<<50)
+// class's instances requires raw isa
+//   This bit is aligned with isa_t->hasCxxDtor to save an instruction.
+#define FAST_REQUIRES_RAW_ISA   (1UL<<50)
+// class or superclass has .cxx_destruct implementation
+#define FAST_HAS_CXX_DTOR       (1UL<<51)
 // instance size in units of 16 bytes
 //   or 0 if the instance size is too big in this field
 //   This field must be LAST
-#define FAST_SHIFTED_SIZE_SHIFT 51
+#define FAST_SHIFTED_SIZE_SHIFT 52
 
 // FAST_ALLOC means
 //   FAST_HAS_CXX_CTOR is set
@@ -487,6 +544,327 @@ struct class_rw_t {
 #define FAST_ALLOC_VALUE (0)
 
 #endif
+
+// The Swift ABI requires that these bits be defined like this on all platforms.
+static_assert(FAST_IS_SWIFT_LEGACY == 1, "resistance is futile");
+static_assert(FAST_IS_SWIFT_STABLE == 2, "resistance is futile");
+
+
+struct class_ro_t {
+    uint32_t flags;
+    uint32_t instanceStart;
+    uint32_t instanceSize;
+#ifdef __LP64__
+    uint32_t reserved;
+#endif
+
+    const uint8_t * ivarLayout;
+    
+    const char * name;
+    method_list_t * baseMethodList;
+    protocol_list_t * baseProtocols;
+    const ivar_list_t * ivars;
+
+    const uint8_t * weakIvarLayout;
+    property_list_t *baseProperties;
+
+    method_list_t *baseMethods() const {
+        return baseMethodList;
+    }
+};
+
+
+/***********************************************************************
+* list_array_tt<Element, List>
+* Generic implementation for metadata that can be augmented by categories.
+*
+* Element is the underlying metadata type (e.g. method_t)
+* List is the metadata's list type (e.g. method_list_t)
+*
+* A list_array_tt has one of three values:
+* - empty
+* - a pointer to a single list
+* - an array of pointers to lists
+*
+* countLists/beginLists/endLists iterate the metadata lists
+* count/begin/end iterate the underlying metadata elements
+**********************************************************************/
+template <typename Element, typename List>
+class list_array_tt {
+    struct array_t {
+        uint32_t count;
+        List* lists[0];
+
+        static size_t byteSize(uint32_t count) {
+            return sizeof(array_t) + count*sizeof(lists[0]);
+        }
+        size_t byteSize() {
+            return byteSize(count);
+        }
+    };
+
+ protected:
+    class iterator {
+        List **lists;
+        List **listsEnd;
+        typename List::iterator m, mEnd;
+
+     public:
+        iterator(List **begin, List **end) 
+            : lists(begin), listsEnd(end)
+        {
+            if (begin != end) {
+                m = (*begin)->begin();
+                mEnd = (*begin)->end();
+            }
+        }
+
+        const Element& operator * () const {
+            return *m;
+        }
+        Element& operator * () {
+            return *m;
+        }
+
+        bool operator != (const iterator& rhs) const {
+            if (lists != rhs.lists) return true;
+            if (lists == listsEnd) return false;  // m is undefined
+            if (m != rhs.m) return true;
+            return false;
+        }
+
+        const iterator& operator ++ () {
+            assert(m != mEnd);
+            m++;
+            if (m == mEnd) {
+                assert(lists != listsEnd);
+                lists++;
+                if (lists != listsEnd) {
+                    m = (*lists)->begin();
+                    mEnd = (*lists)->end();
+                }
+            }
+            return *this;
+        }
+    };
+
+ private:
+    union {
+        List* list;
+        uintptr_t arrayAndFlag;
+    };
+
+    bool hasArray() const {
+        return arrayAndFlag & 1;
+    }
+
+    array_t *array() {
+        return (array_t *)(arrayAndFlag & ~1);
+    }
+
+    void setArray(array_t *array) {
+        arrayAndFlag = (uintptr_t)array | 1;
+    }
+
+ public:
+
+    uint32_t count() {
+        uint32_t result = 0;
+        for (auto lists = beginLists(), end = endLists(); 
+             lists != end;
+             ++lists)
+        {
+            result += (*lists)->count;
+        }
+        return result;
+    }
+
+    iterator begin() {
+        return iterator(beginLists(), endLists());
+    }
+
+    iterator end() {
+        List **e = endLists();
+        return iterator(e, e);
+    }
+
+
+    uint32_t countLists() {
+        if (hasArray()) {
+            return array()->count;
+        } else if (list) {
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+
+    List** beginLists() {
+        if (hasArray()) {
+            return array()->lists;
+        } else {
+            return &list;
+        }
+    }
+
+    List** endLists() {
+        if (hasArray()) {
+            return array()->lists + array()->count;
+        } else if (list) {
+            return &list + 1;
+        } else {
+            return &list;
+        }
+    }
+
+    void attachLists(List* const * addedLists, uint32_t addedCount) {
+        if (addedCount == 0) return;
+
+        if (hasArray()) {
+            // many lists -> many lists
+            uint32_t oldCount = array()->count;
+            uint32_t newCount = oldCount + addedCount;
+            setArray((array_t *)realloc(array(), array_t::byteSize(newCount)));
+            array()->count = newCount;
+            memmove(array()->lists + addedCount, array()->lists, 
+                    oldCount * sizeof(array()->lists[0]));
+            memcpy(array()->lists, addedLists, 
+                   addedCount * sizeof(array()->lists[0]));
+        }
+        else if (!list  &&  addedCount == 1) {
+            // 0 lists -> 1 list
+            list = addedLists[0];
+        } 
+        else {
+            // 1 list -> many lists
+            List* oldList = list;
+            uint32_t oldCount = oldList ? 1 : 0;
+            uint32_t newCount = oldCount + addedCount;
+            setArray((array_t *)malloc(array_t::byteSize(newCount)));
+            array()->count = newCount;
+            if (oldList) array()->lists[addedCount] = oldList;
+            memcpy(array()->lists, addedLists, 
+                   addedCount * sizeof(array()->lists[0]));
+        }
+    }
+
+    void tryFree() {
+        if (hasArray()) {
+            for (uint32_t i = 0; i < array()->count; i++) {
+                try_free(array()->lists[i]);
+            }
+            try_free(array());
+        }
+        else if (list) {
+            try_free(list);
+        }
+    }
+
+    template<typename Result>
+    Result duplicate() {
+        Result result;
+
+        if (hasArray()) {
+            array_t *a = array();
+            result.setArray((array_t *)memdup(a, a->byteSize()));
+            for (uint32_t i = 0; i < a->count; i++) {
+                result.array()->lists[i] = a->lists[i]->duplicate();
+            }
+        } else if (list) {
+            result.list = list->duplicate();
+        } else {
+            result.list = nil;
+        }
+
+        return result;
+    }
+};
+
+
+class method_array_t : 
+    public list_array_tt<method_t, method_list_t> 
+{
+    typedef list_array_tt<method_t, method_list_t> Super;
+
+ public:
+    method_list_t **beginCategoryMethodLists() {
+        return beginLists();
+    }
+    
+    method_list_t **endCategoryMethodLists(Class cls);
+
+    method_array_t duplicate() {
+        return Super::duplicate<method_array_t>();
+    }
+};
+
+
+class property_array_t : 
+    public list_array_tt<property_t, property_list_t> 
+{
+    typedef list_array_tt<property_t, property_list_t> Super;
+
+ public:
+    property_array_t duplicate() {
+        return Super::duplicate<property_array_t>();
+    }
+};
+
+
+class protocol_array_t : 
+    public list_array_tt<protocol_ref_t, protocol_list_t> 
+{
+    typedef list_array_tt<protocol_ref_t, protocol_list_t> Super;
+
+ public:
+    protocol_array_t duplicate() {
+        return Super::duplicate<protocol_array_t>();
+    }
+};
+
+
+struct class_rw_t {
+    // Be warned that Symbolication knows the layout of this structure.
+    uint32_t flags;
+    uint32_t version;
+
+    const class_ro_t *ro;
+
+    method_array_t methods;
+    property_array_t properties;
+    protocol_array_t protocols;
+
+    Class firstSubclass;
+    Class nextSiblingClass;
+
+    char *demangledName;
+
+#if SUPPORT_INDEXED_ISA
+    uint32_t index;
+#endif
+
+    void setFlags(uint32_t set) 
+    {
+        OSAtomicOr32Barrier(set, &flags);
+    }
+
+    void clearFlags(uint32_t clear) 
+    {
+        OSAtomicXor32Barrier(clear, &flags);
+    }
+
+    // set and clear must not overlap
+    void changeFlags(uint32_t set, uint32_t clear) 
+    {
+        assert((set & clear) == 0);
+
+        uint32_t oldf, newf;
+        do {
+            oldf = flags;
+            newf = (oldf | set) & ~clear;
+        } while (!OSAtomicCompareAndSwap32Barrier(oldf, newf, (volatile int32_t *)&flags));
+    }
+};
 
 
 struct class_data_bits_t {
@@ -548,9 +926,14 @@ public:
     {
         assert(!data()  ||  (newData->flags & (RW_REALIZING | RW_FUTURE)));
         // Set during realization or construction only. No locking needed.
-        bits = (bits & ~FAST_DATA_MASK) | (uintptr_t)newData;
+        // Use a store-release fence because there may be concurrent
+        // readers of data and data's contents.
+        uintptr_t newBits = (bits & ~FAST_DATA_MASK) | (uintptr_t)newData;
+        atomic_thread_fence(memory_order_release);
+        bits = newBits;
     }
 
+#if FAST_HAS_DEFAULT_RR
     bool hasDefaultRR() {
         return getBit(FAST_HAS_DEFAULT_RR);
     }
@@ -560,6 +943,17 @@ public:
     void setHasCustomRR() {
         clearBits(FAST_HAS_DEFAULT_RR);
     }
+#else
+    bool hasDefaultRR() {
+        return data()->flags & RW_HAS_DEFAULT_RR;
+    }
+    void setHasDefaultRR() {
+        data()->setFlags(RW_HAS_DEFAULT_RR);
+    }
+    void setHasCustomRR() {
+        data()->clearFlags(RW_HAS_DEFAULT_RR);
+    }
+#endif
 
 #if FAST_HAS_DEFAULT_AWZ
     bool hasDefaultAWZ() {
@@ -616,20 +1010,24 @@ public:
 #endif
 
 #if FAST_REQUIRES_RAW_ISA
-    bool requiresRawIsa() {
+    bool instancesRequireRawIsa() {
         return getBit(FAST_REQUIRES_RAW_ISA);
     }
-    void setRequiresRawIsa() {
+    void setInstancesRequireRawIsa() {
         setBits(FAST_REQUIRES_RAW_ISA);
     }
+#elif SUPPORT_NONPOINTER_ISA
+    bool instancesRequireRawIsa() {
+        return data()->flags & RW_REQUIRES_RAW_ISA;
+    }
+    void setInstancesRequireRawIsa() {
+        data()->setFlags(RW_REQUIRES_RAW_ISA);
+    }
 #else
-# if SUPPORT_NONPOINTER_ISA
-#   error oops
-# endif
-    bool requiresRawIsa() {
+    bool instancesRequireRawIsa() {
         return true;
     }
-    void setRequiresRawIsa() {
+    void setInstancesRequireRawIsa() {
         // nothing
     }
 #endif
@@ -674,12 +1072,38 @@ public:
     }
 #endif
 
-    bool isSwift() {
-        return getBit(FAST_IS_SWIFT);
+    void setClassArrayIndex(unsigned Idx) {
+#if SUPPORT_INDEXED_ISA
+        // 0 is unused as then we can rely on zero-initialisation from calloc.
+        assert(Idx > 0);
+        data()->index = Idx;
+#endif
     }
 
-    void setIsSwift() {
-        setBits(FAST_IS_SWIFT);
+    unsigned classArrayIndex() {
+#if SUPPORT_INDEXED_ISA
+        return data()->index;
+#else
+        return 0;
+#endif
+    }
+
+    bool isAnySwift() {
+        return isSwiftStable() || isSwiftLegacy();
+    }
+
+    bool isSwiftStable() {
+        return getBit(FAST_IS_SWIFT_STABLE);
+    }
+    void setIsSwiftStable() {
+        setBits(FAST_IS_SWIFT_STABLE);
+    }
+
+    bool isSwiftLegacy() {
+        return getBit(FAST_IS_SWIFT_LEGACY);
+    }
+    void setIsSwiftLegacy() {
+        setBits(FAST_IS_SWIFT_LEGACY);
     }
 };
 
@@ -734,16 +1158,18 @@ struct objc_class : objc_object {
     void setHasCustomAWZ(bool inherited = false);
     void printCustomAWZ(bool inherited);
 
-    bool requiresRawIsa() {
-        return bits.requiresRawIsa();
+    bool instancesRequireRawIsa() {
+        return bits.instancesRequireRawIsa();
     }
-    void setRequiresRawIsa(bool inherited = false);
-    void printRequiresRawIsa(bool inherited);
+    void setInstancesRequireRawIsa(bool inherited = false);
+    void printInstancesRequireRawIsa(bool inherited);
 
-    bool canAllocIndexed() {
-        return !requiresRawIsa();
+    bool canAllocNonpointer() {
+        assert(!isFuture());
+        return !instancesRequireRawIsa();
     }
     bool canAllocFast() {
+        assert(!isFuture());
         return bits.canAllocFast();
     }
 
@@ -767,8 +1193,28 @@ struct objc_class : objc_object {
     }
 
 
-    bool isSwift() {
-        return bits.isSwift();
+    bool isSwiftStable() {
+        return bits.isSwiftStable();
+    }
+
+    bool isSwiftLegacy() {
+        return bits.isSwiftLegacy();
+    }
+
+    bool isAnySwift() {
+        return bits.isAnySwift();
+    }
+
+
+    // Return YES if the class's ivars are managed by ARC, 
+    // or the class is MRC but has ARC-style weak ivars.
+    bool hasAutomaticIvars() {
+        return data()->ro->flags & (RO_IS_ARC | RO_HAS_WEAK_WITHOUT_ARC);
+    }
+
+    // Return YES if the class's ivars are managed by ARC.
+    bool isARC() {
+        return data()->ro->flags & RO_IS_ARC;
     }
 
 
@@ -794,17 +1240,6 @@ struct objc_class : objc_object {
 
     void setShouldGrowCache(bool) {
         // fixme good or bad for memory use?
-    }
-
-    bool shouldFinalizeOnMainThread() {
-        // finishInitializing() propagates this flag from the superclass.
-        assert(isRealized());
-        return data()->flags & RW_FINALIZE_ON_MAIN_THREAD;
-    }
-
-    void setShouldFinalizeOnMainThread() {
-        assert(isRealized());
-        setInfo(RW_FINALIZE_ON_MAIN_THREAD);
     }
 
     bool isInitializing() {
@@ -874,6 +1309,18 @@ struct objc_class : objc_object {
     const char *nameForLogging();
 
     // May be unaligned depending on class's ivars.
+    uint32_t unalignedInstanceStart() {
+        assert(isRealized());
+        return data()->ro->instanceStart;
+    }
+
+    // Class's instance start rounded up to a pointer-size boundary.
+    // This is used for ARC layout bitmaps.
+    uint32_t alignedInstanceStart() {
+        return word_align(unalignedInstanceStart());
+    }
+
+    // May be unaligned depending on class's ivars.
     uint32_t unalignedInstanceSize() {
         assert(isRealized());
         return data()->ro->instanceSize;
@@ -899,6 +1346,17 @@ struct objc_class : objc_object {
         }
         bits.setFastInstanceSize(newSize);
     }
+
+    void chooseClassArrayIndex();
+
+    void setClassArrayIndex(unsigned Idx) {
+        bits.setClassArrayIndex(Idx);
+    }
+
+    unsigned classArrayIndex() {
+        return bits.classArrayIndex();
+    }
+
 };
 
 
@@ -927,6 +1385,15 @@ struct category_t {
     struct method_list_t *classMethods;
     struct protocol_list_t *protocols;
     struct property_list_t *instanceProperties;
+    // Fields below this point are not always present on disk.
+    struct property_list_t *_classProperties;
+
+    method_list_t *methodsForMeta(bool isMeta) {
+        if (isMeta) return classMethods;
+        else return instanceMethods;
+    }
+
+    property_list_t *propertiesForMeta(bool isMeta, struct header_info *hi);
 };
 
 struct objc_super2 {
@@ -943,12 +1410,16 @@ struct message_ref_t {
 extern Method protocol_getMethod(protocol_t *p, SEL sel, bool isRequiredMethod, bool isInstanceMethod, bool recursive);
 
 static inline void
-foreach_realized_class_and_subclass_2(Class top, bool (^code)(Class)) 
+foreach_realized_class_and_subclass_2(Class top, unsigned& count,
+                                      std::function<bool (Class)> code) 
 {
-    // rwlock_assert_writing(&runtimeLock);
+    // runtimeLock.assertLocked();
     assert(top);
     Class cls = top;
     while (1) {
+        if (--count == 0) {
+            _objc_fatal("Memory corruption in class list.");
+        }
         if (!code(cls)) break;
 
         if (cls->data()->firstSubclass) {
@@ -956,6 +1427,9 @@ foreach_realized_class_and_subclass_2(Class top, bool (^code)(Class))
         } else {
             while (!cls->data()->nextSiblingClass  &&  cls != top) {
                 cls = cls->superclass;
+                if (--count == 0) {
+                    _objc_fatal("Memory corruption in class list.");
+                }
             }
             if (cls == top) break;
             cls = cls->data()->nextSiblingClass;
@@ -963,14 +1437,42 @@ foreach_realized_class_and_subclass_2(Class top, bool (^code)(Class))
     }
 }
 
+extern Class firstRealizedClass();
+extern unsigned int unreasonableClassCount();
+
+// Enumerates a class and all of its realized subclasses.
 static inline void
-foreach_realized_class_and_subclass(Class top, void (^code)(Class)) 
+foreach_realized_class_and_subclass(Class top,
+                                    std::function<void (Class)> code)
 {
-    foreach_realized_class_and_subclass_2(top, ^bool(Class cls) { 
-        code(cls); return true; 
+    unsigned int count = unreasonableClassCount();
+
+    foreach_realized_class_and_subclass_2(top, count,
+                                          [&code](Class cls) -> bool
+    {
+        code(cls);
+        return true; 
     });
 }
 
-__END_DECLS
+// Enumerates all realized classes and metaclasses.
+static inline void
+foreach_realized_class_and_metaclass(std::function<void (Class)> code) 
+{
+    unsigned int count = unreasonableClassCount();
+    
+    for (Class top = firstRealizedClass(); 
+         top != nil; 
+         top = top->data()->nextSiblingClass) 
+    {
+        foreach_realized_class_and_subclass_2(top, count,
+                                              [&code](Class cls) -> bool
+        {
+            code(cls);
+            return true; 
+        });
+    }
+
+}
 
 #endif

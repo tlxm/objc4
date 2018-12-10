@@ -93,18 +93,7 @@ enum {
     INIT_CACHE_SIZE      = (1 << INIT_CACHE_SIZE_LOG2)
 };
 
-static size_t log2u(size_t x)
-{
-    unsigned int log;
-
-    log = 0;
-    while (x >>= 1)
-        log += 1;
-
-    return log;
-}
-
-static void cache_collect_free(struct bucket_t *data, size_t size);
+static void cache_collect_free(struct bucket_t *data, mask_t capacity);
 static int _collecting_in_critical(void);
 static void _garbage_make_room(void);
 
@@ -116,29 +105,54 @@ static unsigned int cache_counts[16];
 static size_t cache_allocations;
 static size_t cache_collections;
 
+static void recordNewCache(mask_t capacity)
+{
+    size_t bucket = log2u(capacity);
+    if (bucket < countof(cache_counts)) {
+        cache_counts[bucket]++;
+    }
+    cache_allocations++;
+}
+
+static void recordDeadCache(mask_t capacity)
+{
+    size_t bucket = log2u(capacity);
+    if (bucket < countof(cache_counts)) {
+        cache_counts[bucket]--;
+    }
+}
 
 /***********************************************************************
 * Pointers used by compiled class objects
 * These use asm to avoid conflicts with the compiler's internal declarations
 **********************************************************************/
 
+// EMPTY_BYTES includes space for a cache end marker bucket.
+// This end marker doesn't actually have the wrap-around pointer 
+// because cache scans always find an empty bucket before they might wrap.
+// 1024 buckets is fairly common.
+#if DEBUG
+    // Use a smaller size to exercise heap-allocated empty caches.
+#   define EMPTY_BYTES ((8+1)*16)
+#else
+#   define EMPTY_BYTES ((1024+1)*16)
+#endif
+
+#define stringize(x) #x
+#define stringize2(x) stringize(x)
+
 // "cache" is cache->buckets; "vtable" is cache->mask/occupied
 // hack to avoid conflicts with compiler's internal declaration
 asm("\n .section __TEXT,__const"
-    "\n .globl __objc_empty_cache"
-#if __LP64__
-    "\n .align 3"
-    "\n __objc_empty_cache: .quad 0"
-#else
-    "\n .align 2"
-    "\n __objc_empty_cache: .long 0"
-#endif
     "\n .globl __objc_empty_vtable"
     "\n .set __objc_empty_vtable, 0"
+    "\n .globl __objc_empty_cache"
+    "\n .align 3"
+    "\n __objc_empty_cache: .space " stringize2(EMPTY_BYTES)
     );
 
 
-#if __arm__
+#if __arm__  ||  __x86_64__  ||  __i386__
 // objc_msgSend has few registers available.
 // Cache scan increments and wraps at special end-marking bucket.
 #define CACHE_END_MARKER 1
@@ -146,8 +160,8 @@ static inline mask_t cache_next(mask_t i, mask_t mask) {
     return (i+1) & mask;
 }
 
-#elif __i386__  ||  __x86_64__  ||  __arm64__
-// objc_msgSend has lots of registers and/or memory operands available.
+#elif __arm64__
+// objc_msgSend has lots of registers available.
 // Cache scan decrements. No end marker needed.
 #define CACHE_END_MARKER 0
 static inline mask_t cache_next(mask_t i, mask_t mask) {
@@ -156,13 +170,6 @@ static inline mask_t cache_next(mask_t i, mask_t mask) {
 
 #else
 #error unknown architecture
-#endif
-
-
-// cannot mix sel-side caches with ignored selector constant
-// ignored selector constant also not implemented for class-side caches here
-#if SUPPORT_IGNORED_SELECTOR_CONSTANT
-#error sorry
 #endif
 
 
@@ -182,37 +189,54 @@ static inline mask_t cache_next(mask_t i, mask_t mask) {
         : "=a" (_clbr) : "0" (0) : "ebx", "ecx", "edx", "cc", "memory" \
                                                     ); } while(0)
 
-#elif __arm__
+#elif __arm__  ||  __arm64__
 #define mega_barrier() \
     __asm__ __volatile__( \
         "dsb    ish" \
         : : : "memory")
 
-#elif __arm64__
-// Use atomic double-word updates instead.
-// This requires cache buckets not cross cache line boundaries.
-#undef mega_barrier
-#define stp(onep, twop, destp)                  \
-    __asm__ ("stp %[one], %[two], [%[dest]]"    \
-             : "=m" (((uint64_t *)(destp))[0]), \
-               "=m" (((uint64_t *)(destp))[1])  \
-             : [one] "r" (onep),                \
-               [two] "r" (twop),                \
-               [dest] "r" (destp)               \
-             : /* no clobbers */                \
-             )
-#define ldp(onep, twop, srcp)                   \
-    __asm__ ("ldp %[one], %[two], [%[src]]"     \
-             : [one] "=r" (onep),               \
-               [two] "=r" (twop),               \
-             : "m" (((uint64_t *)(srcp))[0]),   \
-               "m" (((uint64_t *)(srcp))[1])    \
-               [src] "r" (srcp)                 \
-             : /* no clobbers */                \
-             )
-
 #else
 #error unknown architecture
+#endif
+
+#if __arm64__
+
+// Pointer-size register prefix for inline asm
+# if __LP64__
+#   define p "x"  // true arm64
+# else
+#   define p "w"  // arm64_32
+# endif
+
+// Use atomic double-word instructions to update cache entries.
+// This requires cache buckets not cross cache line boundaries.
+static ALWAYS_INLINE void
+stp(uintptr_t onep, uintptr_t twop, void *destp)
+{
+    __asm__ ("stp %" p "[one], %" p "[two], [%x[dest]]"
+             : "=m" (((uintptr_t *)(destp))[0]),
+               "=m" (((uintptr_t *)(destp))[1])
+             : [one] "r" (onep),
+               [two] "r" (twop),
+               [dest] "r" (destp)
+             : /* no clobbers */
+             );
+}
+
+static ALWAYS_INLINE void __unused
+ldp(uintptr_t& onep, uintptr_t& twop, const void *srcp)
+{
+    __asm__ ("ldp %" p "[one], %" p "[two], [%x[src]]"
+             : [one] "=r" (onep),
+               [two] "=r" (twop)
+             : "m" (((const uintptr_t *)(srcp))[0]),
+               "m" (((const uintptr_t *)(srcp))[1]),
+               [src] "r" (srcp)
+             : /* no clobbers */
+             );
+}
+
+#undef p
 #endif
 
 
@@ -224,19 +248,17 @@ static inline mask_t cache_hash(cache_key_t key, mask_t mask)
     return (mask_t)(key & mask);
 }
 
-cache_t *getCache(Class cls, SEL sel __unused) 
+cache_t *getCache(Class cls) 
 {
     assert(cls);
     return &cls->cache;
 }
 
-cache_key_t getKey(Class cls __unused, SEL sel) 
+cache_key_t getKey(SEL sel) 
 {
     assert(sel);
     return (cache_key_t)sel;
 }
-
-
 
 #if __arm64__
 
@@ -244,30 +266,24 @@ void bucket_t::set(cache_key_t newKey, IMP newImp)
 {
     assert(_key == 0  ||  _key == newKey);
 
-    // LDP/STP guarantees that all observers get 
-    // either key/imp or newKey/newImp
-    stp(newKey, newImp, this);
-}
+    static_assert(offsetof(bucket_t,_imp) == 0 && offsetof(bucket_t,_key) == sizeof(void *),
+                  "bucket_t doesn't match arm64 bucket_t::set()");
 
-void cache_t::setBucketsAndMask(struct bucket_t *newBuckets, mask_t newMask)
-{
-    // ensure other threads see buckets contents before buckets pointer
-    // see Barrier Litmus Tests and Cookbook, 
-    // "Address Dependency with object construction"
-    __sync_synchronize();
-
-    // LDP/STP guarantees that all observers get 
-    // old mask/buckets or new mask/buckets
-
-    mask_t newOccupied = 0;
-    uint64_t mask_and_occupied =
-        (uint64_t)newMask | ((uint64_t)newOccupied << 32);
-    stp(newBuckets, mask_and_occupied, this);
-}
-
-// arm64
+#if __has_feature(ptrauth_calls)
+    // Authenticate as a C function pointer and re-sign for the cache bucket.
+    uintptr_t signedImp = _imp.prepareWrite(newImp);
 #else
-// not arm64
+    // No function pointer signing.
+    uintptr_t signedImp = (uintptr_t)newImp;
+#endif
+
+    // Write to the bucket.
+    // LDP/STP guarantees that all observers get
+    // either imp/key or newImp/newKey
+    stp(signedImp, newKey, this);
+}
+
+#else
 
 void bucket_t::set(cache_key_t newKey, IMP newImp)
 {
@@ -286,6 +302,8 @@ void bucket_t::set(cache_key_t newKey, IMP newImp)
         _key = newKey;
     }
 }
+
+#endif
 
 void cache_t::setBucketsAndMask(struct bucket_t *newBuckets, mask_t newMask)
 {
@@ -308,8 +326,6 @@ void cache_t::setBucketsAndMask(struct bucket_t *newBuckets, mask_t newMask)
     _occupied = 0;
 }
 
-// not arm64
-#endif
 
 struct bucket_t *cache_t::buckets() 
 {
@@ -331,7 +347,7 @@ void cache_t::incrementOccupied()
     _occupied++;
 }
 
-void cache_t::setEmpty()
+void cache_t::initializeToEmpty()
 {
     bzero(this, sizeof(*this));
     _buckets = (bucket_t *)&_objc_empty_cache;
@@ -349,7 +365,7 @@ mask_t cache_t::capacity()
 size_t cache_t::bytesForCapacity(uint32_t cap) 
 {
     // fixme put end marker inline when capacity+1 malloc is inefficient
-    return sizeof(cache_t) * (cap + 1);
+    return sizeof(bucket_t) * (cap + 1);
 }
 
 bucket_t *cache_t::endMarker(struct bucket_t *b, uint32_t cap) 
@@ -364,7 +380,7 @@ bucket_t *allocateBuckets(mask_t newCapacity)
     // This can't overflow mask_t because newCapacity is a power of 2.
     // fixme instead put the end mark inline when +1 is malloc-inefficient
     bucket_t *newBuckets = (bucket_t *)
-        _calloc_internal(cache_t::bytesForCapacity(newCapacity), 1);
+        calloc(cache_t::bytesForCapacity(newCapacity), 1);
 
     bucket_t *end = cache_t::endMarker(newBuckets, newCapacity);
 
@@ -374,45 +390,89 @@ bucket_t *allocateBuckets(mask_t newCapacity)
     end->setKey((cache_key_t)(uintptr_t)1);
     end->setImp((IMP)(newBuckets - 1));
 #else
-#   error unknown architecture
+    // End marker's key is 1 and imp points to the first bucket.
+    end->setKey((cache_key_t)(uintptr_t)1);
+    end->setImp((IMP)newBuckets);
 #endif
     
+    if (PrintCaches) recordNewCache(newCapacity);
+
     return newBuckets;
 }
 
 #else
 
+size_t cache_t::bytesForCapacity(uint32_t cap) 
+{
+    return sizeof(bucket_t) * cap;
+}
+
 bucket_t *allocateBuckets(mask_t newCapacity)
 {
-    return (bucket_t *)_calloc_internal(newCapacity, sizeof(bucket_t));
+    if (PrintCaches) recordNewCache(newCapacity);
+
+    return (bucket_t *)calloc(cache_t::bytesForCapacity(newCapacity), 1);
 }
 
 #endif
 
 
+bucket_t *emptyBucketsForCapacity(mask_t capacity, bool allocate = true)
+{
+    cacheUpdateLock.assertLocked();
+
+    size_t bytes = cache_t::bytesForCapacity(capacity);
+
+    // Use _objc_empty_cache if the buckets is small enough.
+    if (bytes <= EMPTY_BYTES) {
+        return (bucket_t *)&_objc_empty_cache;
+    }
+
+    // Use shared empty buckets allocated on the heap.
+    static bucket_t **emptyBucketsList = nil;
+    static mask_t emptyBucketsListCount = 0;
+    
+    mask_t index = log2u(capacity);
+
+    if (index >= emptyBucketsListCount) {
+        if (!allocate) return nil;
+
+        mask_t newListCount = index + 1;
+        bucket_t *newBuckets = (bucket_t *)calloc(bytes, 1);
+        emptyBucketsList = (bucket_t**)
+            realloc(emptyBucketsList, newListCount * sizeof(bucket_t *));
+        // Share newBuckets for every un-allocated size smaller than index.
+        // The array is therefore always fully populated.
+        for (mask_t i = emptyBucketsListCount; i < newListCount; i++) {
+            emptyBucketsList[i] = newBuckets;
+        }
+        emptyBucketsListCount = newListCount;
+
+        if (PrintCaches) {
+            _objc_inform("CACHES: new empty buckets at %p (capacity %zu)", 
+                         newBuckets, (size_t)capacity);
+        }
+    }
+
+    return emptyBucketsList[index];
+}
+
+
+bool cache_t::isConstantEmptyCache()
+{
+    return 
+        occupied() == 0  &&  
+        buckets() == emptyBucketsForCapacity(capacity(), false);
+}
+
 bool cache_t::canBeFreed()
 {
-    return buckets() != (bucket_t *)&_objc_empty_cache;
+    return !isConstantEmptyCache();
 }
 
 
 void cache_t::reallocate(mask_t oldCapacity, mask_t newCapacity)
 {
-    if (PrintCaches) {
-        size_t bucket = log2u(newCapacity);
-        if (bucket < sizeof(cache_counts) / sizeof(cache_counts[0])) {
-            cache_counts[bucket]++;
-        }
-        cache_allocations++;
-        
-        if (oldCapacity) {
-            bucket = log2u(oldCapacity);
-            if (bucket < sizeof(cache_counts) / sizeof(cache_counts[0])) {
-                cache_counts[bucket]--;
-            }
-        }
-    }
-
     bool freeOld = canBeFreed();
 
     bucket_t *oldBuckets = buckets();
@@ -428,24 +488,11 @@ void cache_t::reallocate(mask_t oldCapacity, mask_t newCapacity)
     setBucketsAndMask(newBuckets, newCapacity - 1);
     
     if (freeOld) {
-        cache_collect_free(oldBuckets, oldCapacity * sizeof(bucket_t));
+        cache_collect_free(oldBuckets, oldCapacity);
         cache_collect(false);
     }
 }
 
-
-// called by objc_msgSend
-extern "C" 
-void objc_msgSend_corrupt_cache_error(id receiver, SEL sel, Class isa)
-{
-    cache_t::bad_cache(receiver, sel, isa);
-}
-
-extern "C" 
-void cache_getImp_corrupt_cache_error(id receiver, SEL sel, Class isa)
-{
-    cache_t::bad_cache(receiver, sel, isa);
-}
 
 void cache_t::bad_cache(id receiver, SEL sel, Class isa)
 {
@@ -469,11 +516,12 @@ void cache_t::bad_cache(id receiver, SEL sel, Class isa)
     _objc_inform_now_and_on_crash
         ("isa '%s'", isa->nameForLogging());
     _objc_fatal
-        ("Method cache corrupted.");
+        ("Method cache corrupted. This may be a message to an "
+         "invalid object, or a memory error somewhere else.");
 }
 
 
-bucket_t * cache_t::find(cache_key_t k)
+bucket_t * cache_t::find(cache_key_t k, id receiver)
 {
     assert(k != 0);
 
@@ -489,13 +537,13 @@ bucket_t * cache_t::find(cache_key_t k)
 
     // hack
     Class cls = (Class)((uintptr_t)this - offsetof(objc_class, cache));
-    cache_t::bad_cache(nil, (SEL)k, cls);
+    cache_t::bad_cache(receiver, (SEL)k, cls);
 }
 
 
 void cache_t::expand()
 {
-    mutex_assert_locked(&cacheUpdateLock);
+    cacheUpdateLock.assertLocked();
     
     uint32_t oldCapacity = capacity();
     uint32_t newCapacity = oldCapacity ? oldCapacity*2 : INIT_CACHE_SIZE;
@@ -510,9 +558,9 @@ void cache_t::expand()
 }
 
 
-static void cache_fill_nolock(Class cls, SEL sel, IMP imp)
+static void cache_fill_nolock(Class cls, SEL sel, IMP imp, id receiver)
 {
-    mutex_assert_locked(&cacheUpdateLock);
+    cacheUpdateLock.assertLocked();
 
     // Never cache before +initialize is done
     if (!cls->isInitialized()) return;
@@ -521,32 +569,37 @@ static void cache_fill_nolock(Class cls, SEL sel, IMP imp)
     // before we grabbed the cacheUpdateLock.
     if (cache_getImp(cls, sel)) return;
 
-    cache_t *cache = getCache(cls, sel);
-    cache_key_t key = getKey(cls, sel);
+    cache_t *cache = getCache(cls);
+    cache_key_t key = getKey(sel);
 
     // Use the cache as-is if it is less than 3/4 full
     mask_t newOccupied = cache->occupied() + 1;
-    if ((newOccupied * 4) <= (cache->mask() + 1) * 3) {
-        // Cache is less than 3/4 full.
-    } else {
+    mask_t capacity = cache->capacity();
+    if (cache->isConstantEmptyCache()) {
+        // Cache is read-only. Replace it.
+        cache->reallocate(capacity, capacity ?: INIT_CACHE_SIZE);
+    }
+    else if (newOccupied <= capacity / 4 * 3) {
+        // Cache is less than 3/4 full. Use it as-is.
+    }
+    else {
         // Cache is too full. Expand it.
         cache->expand();
     }
 
-    // Scan for the first unused slot (or used for this class) and insert there
+    // Scan for the first unused slot and insert there.
     // There is guaranteed to be an empty slot because the 
     // minimum size is 4 and we resized at 3/4 full.
-    bucket_t *bucket = cache->find(key);
+    bucket_t *bucket = cache->find(key, receiver);
     if (bucket->key() == 0) cache->incrementOccupied();
     bucket->set(key, imp);
 }
 
-void cache_fill(Class cls, SEL sel, IMP imp)
+void cache_fill(Class cls, SEL sel, IMP imp, id receiver)
 {
 #if !DEBUG_TASK_THREADS
-    mutex_lock(&cacheUpdateLock);
-    cache_fill_nolock(cls, sel, imp);
-    mutex_unlock(&cacheUpdateLock);
+    mutex_locker_t lock(cacheUpdateLock);
+    cache_fill_nolock(cls, sel, imp, receiver);
 #else
     _collecting_in_critical();
     return;
@@ -554,72 +607,32 @@ void cache_fill(Class cls, SEL sel, IMP imp)
 }
 
 
-// Reset any entry for cls/sel to the uncached lookup
-static void cache_eraseMethod_nolock(Class cls, SEL sel)
-{
-    mutex_assert_locked(&cacheUpdateLock);
-
-    cache_t *cache = getCache(cls, sel);
-    cache_key_t key = getKey(cls, sel);
-
-    bucket_t *bucket = cache->find(key);
-    if (bucket->key() == key) {
-        bucket->setImp(_objc_msgSend_uncached_impcache);
-    }
-}
-
-
-// Resets cache entries for all methods in mlist for cls and its subclasses.
-void cache_eraseMethods(Class cls, method_list_t *mlist)
-{
-    rwlock_assert_writing(&runtimeLock);
-    mutex_lock(&cacheUpdateLock);
-
-    foreach_realized_class_and_subclass(cls, ^(Class c){
-        for (uint32_t m = 0; m < mlist->count; m++) {
-            SEL sel = mlist->get(m).name;
-            cache_eraseMethod_nolock(c, sel);
-        }
-    });
-
-    mutex_unlock(&cacheUpdateLock);
-}
-
-
-// Reset any copies of imp in this cache to the uncached lookup
-void cache_eraseImp_nolock(Class cls, SEL sel, IMP imp)
-{
-    mutex_assert_locked(&cacheUpdateLock);
-
-    cache_t *cache = getCache(cls, sel);
-
-    bucket_t *b = cache->buckets();
-    mask_t count = cache->capacity();
-    for (mask_t i = 0; i < count; i++) {
-        if (b[i].imp() == imp) {
-            b[i].setImp(_objc_msgSend_uncached_impcache);
-        }
-    }
-}
-
-
-void cache_eraseImp(Class cls, SEL sel, IMP imp) 
-{
-    mutex_lock(&cacheUpdateLock);
-    cache_eraseImp_nolock(cls, sel, imp);
-    mutex_unlock(&cacheUpdateLock);
-}
-
-
 // Reset this entire cache to the uncached lookup by reallocating it.
 // This must not shrink the cache - that breaks the lock-free scheme.
-void cache_erase_nolock(cache_t *cache)
+void cache_erase_nolock(Class cls)
 {
-    mutex_assert_locked(&cacheUpdateLock);
+    cacheUpdateLock.assertLocked();
+
+    cache_t *cache = getCache(cls);
 
     mask_t capacity = cache->capacity();
     if (capacity > 0  &&  cache->occupied() > 0) {
-        cache->reallocate(capacity, capacity);
+        auto oldBuckets = cache->buckets();
+        auto buckets = emptyBucketsForCapacity(capacity);
+        cache->setBucketsAndMask(buckets, capacity - 1); // also clears occupied
+
+        cache_collect_free(oldBuckets, capacity);
+        cache_collect(false);
+    }
+}
+
+
+void cache_delete(Class cls)
+{
+    mutex_locker_t lock(cacheUpdateLock);
+    if (cls->cache.canBeFreed()) {
+        if (PrintCaches) recordDeadCache(cls->cache.capacity());
+        free(cls->cache.buckets());
     }
 }
 
@@ -662,7 +675,7 @@ static uintptr_t _get_pc_for_thread(thread_t thread)
     arm_thread_state64_t state;
     unsigned int count = ARM_THREAD_STATE64_COUNT;
     kern_return_t okay = thread_get_state (thread, ARM_THREAD_STATE64, (thread_state_t)&state, &count);
-    return (okay == KERN_SUCCESS) ? state.__pc : PC_SENTINEL;
+    return (okay == KERN_SUCCESS) ? arm_thread_state64_get_pc(state) : PC_SENTINEL;
 }
 #else
 {
@@ -679,8 +692,8 @@ static uintptr_t _get_pc_for_thread(thread_t thread)
 * reading function is in progress because it might still be using 
 * the garbage memory.
 **********************************************************************/
-OBJC_EXPORT uintptr_t objc_entryPoints[];
-OBJC_EXPORT uintptr_t objc_exitPoints[];
+extern "C" uintptr_t objc_entryPoints[];
+extern "C"  uintptr_t objc_exitPoints[];
 
 static int _collecting_in_critical(void)
 {
@@ -789,7 +802,7 @@ static void _garbage_make_room(void)
     {
         first = 0;
         garbage_refs = (bucket_t**)
-            _malloc_internal(INIT_GARBAGE_COUNT * sizeof(void *));
+            malloc(INIT_GARBAGE_COUNT * sizeof(void *));
         garbage_max = INIT_GARBAGE_COUNT;
     }
 
@@ -797,7 +810,7 @@ static void _garbage_make_room(void)
     else if (garbage_count == garbage_max)
     {
         garbage_refs = (bucket_t**)
-            _realloc_internal(garbage_refs, garbage_max * 2 * sizeof(void *));
+            realloc(garbage_refs, garbage_max * 2 * sizeof(void *));
         garbage_max *= 2;
     }
 }
@@ -810,12 +823,14 @@ static void _garbage_make_room(void)
 * precisely the block's size.
 * Cache locks: cacheUpdateLock must be held by the caller.
 **********************************************************************/
-static void cache_collect_free(bucket_t *data, size_t size)
+static void cache_collect_free(bucket_t *data, mask_t capacity)
 {
-    mutex_assert_locked(&cacheUpdateLock);
+    cacheUpdateLock.assertLocked();
+
+    if (PrintCaches) recordDeadCache(capacity);
 
     _garbage_make_room ();
-    garbage_byte_size += size;
+    garbage_byte_size += cache_t::bytesForCapacity(capacity);
     garbage_refs[garbage_count++] = data;
 }
 
@@ -827,7 +842,7 @@ static void cache_collect_free(bucket_t *data, size_t size)
 **********************************************************************/
 void cache_collect(bool collectALot)
 {
-    mutex_assert_locked(&cacheUpdateLock);
+    cacheUpdateLock.assertLocked();
 
     // Done if the garbage is not full
     if (garbage_byte_size < garbage_threshold  &&  !collectALot) {
@@ -861,8 +876,11 @@ void cache_collect(bool collectALot)
     }
     
     // Dispose all refs now in the garbage
+    // Erase each entry so debugging tools don't see stale pointers.
     while (garbage_count--) {
-        free(garbage_refs[garbage_count]);
+        auto dead = garbage_refs[garbage_count];
+        garbage_refs[garbage_count] = nil;
+        free(dead);
     }
     
     // Clear the garbage count and total size indicator
@@ -874,7 +892,7 @@ void cache_collect(bool collectALot)
         size_t total_count = 0;
         size_t total_size = 0;
 
-        for (i = 0; i < sizeof(cache_counts) / sizeof(cache_counts[0]); i++) {
+        for (i = 0; i < countof(cache_counts); i++) {
             int count = cache_counts[i];
             int slots = 1 << i;
             size_t size = count * slots * sizeof(bucket_t);
